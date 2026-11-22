@@ -46,9 +46,15 @@ def previous_tag(ref):
         return None
 
 
-def changed_files(commit, merge):
-    base = f"{commit}^1" if merge else f"{commit}^"
-    return [f for f in git("diff", "--name-only", base, commit).splitlines() if f]
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's empty tree: the base of a root commit
+
+
+def diff_base(commit, parents):
+    return f"{commit}^1" if parents else EMPTY_TREE
+
+
+def changed_files(commit, parents):
+    return [f for f in git("diff", "--name-only", diff_base(commit, parents), commit).splitlines() if f]
 
 
 def github_pr(repo, number):
@@ -77,12 +83,13 @@ def collect(repo, prev, ref):
     updates, devices = [], []
     for line in git("log", "--first-parent", "--reverse", "--format=%H%x09%P%x09%s", span).splitlines():
         sha, parents, subject = line.split("\t", 2)
-        merge = len(parents.split()) > 1
-        files = changed_files(sha, merge)
+        parents = parents.split()
+        merge = len(parents) > 1
+        files = changed_files(sha, parents)
         if not files or all(NON_APP.match(f) for f in files):
             continue  # documentation, CI or repository housekeeping only
         added_driver = any(f.startswith("src/drivers/") and f.endswith(".cpp") for f in
-                           git("diff", "--name-only", "--diff-filter=A", f"{sha}^1" if merge else f"{sha}^", sha).splitlines())
+                           git("diff", "--name-only", "--diff-filter=A", diff_base(sha, parents), sha).splitlines())
         m = re.match(r"Merge (?:PR|pull request) #(\d+)", subject)
         if merge and m:
             number = int(m.group(1))
