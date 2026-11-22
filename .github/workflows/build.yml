@@ -2,7 +2,9 @@ name: build
 
 on:
   push:
-    branches: [main]
+    # Fork: a push to the development branch whose commit message carries "[release vX.Y.Z]" also
+    # publishes a release (the session that develops it may push this branch but not tags).
+    branches: [main, claude/kind-keller-st7d7d]
     tags: ["v*"]
   pull_request:
 
@@ -13,6 +15,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}  # the release to publish, empty for none
     steps:
       # Actions are pinned to exact commits so a moved tag cannot swap in different code.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -25,17 +29,28 @@ jobs:
           suppress-deprecation-warnings: msystem-mingw64
 
       - name: Select version and update channel
+        id: version
         shell: pwsh
+        env:
+          # Passed as data, never pasted into the script: a commit message is free text.
+          COMMIT_MESSAGE: ${{ github.event_name == 'push' && github.event.head_commit.message || '' }}
         run: |
           $version = '0.0.0'
           $channel = 'dev'
+          $tag = ''
           if ($env:GITHUB_REF -like 'refs/tags/v*') {
             $version = $env:GITHUB_REF_NAME.Substring(1)
             if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'Unsupported release tag' }
             if ($env:GITHUB_REPOSITORY -eq 'krisgfx9/Wireless-Device-Battery-Monitor') { $channel = 'stable' }
+            $tag = $env:GITHUB_REF_NAME
+          } elseif ($env:GITHUB_REF -eq 'refs/heads/claude/kind-keller-st7d7d' -and
+                    $env:COMMIT_MESSAGE -match '\[release v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\]') {
+            $version = $Matches[1]
+            $tag = "v$version"
           }
           "WB_VERSION=$version" >> $env:GITHUB_ENV
           "WB_CHANNEL=$channel" >> $env:GITHUB_ENV
+          "tag=$tag" >> $env:GITHUB_OUTPUT
 
       - name: Build BatteryHub.exe
         shell: msys2 {0}
@@ -65,10 +80,11 @@ jobs:
           name: BatteryHub
           path: dist/*
 
-  # Only this job can publish, and only for version tags pushed by the maintainer.
+  # Only this job can publish: for version tags pushed by the maintainer, or a "[release vX.Y.Z]"
+  # commit on the fork's development branch (the tag is then created here, on that commit).
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.build.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -81,6 +97,8 @@ jobs:
       - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           files: dist/*
+          tag_name: ${{ needs.build.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           append_body: true
           body: |
             Enjoying BatteryHub? Support it on [Ko-fi](https://ko-fi.com/krisgfx), [PayPal](https://www.paypal.com/paypalme/krisgfx) or [GitHub Sponsors](https://github.com/sponsors/krisgfx9).
@@ -96,4 +114,5 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 scripts/discord-release.py --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        run: python3 scripts/discord-release.py --tag "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
