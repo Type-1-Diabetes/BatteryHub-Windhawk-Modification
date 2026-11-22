@@ -63,7 +63,7 @@ constexpr UINT ALERT_ICON_ID = 2;
 enum MenuId : UINT {
     ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT, ID_REPORT,
     ID_BRAND_COLORS, ID_STACKED, ID_SHOW_DISCONNECTED, ID_RECORD_HISTORY, ID_DIM_SLEEPING,
-    ID_TRAY_WHEN_EMPTY, ID_MAKE_ROOM, ID_FAR_LEFT, ID_PERCENT_SIGN, ID_RING_STYLE, ID_BEFORE_APPS, ID_CONNECTION_ICONS, ID_KEEP_MOUSE_LAST_KNOWN, ID_SHORT_RUNTIME_ALERT, ID_HOVER_CARD, ID_HOVER_CHART, ID_TRAY_DEVICE_ICONS, ID_ANIMATE_CHARGING, ID_TRACK_SINCE, ID_TRACK_AWAKE, ID_TRACK_EMPTY, ID_RUNTIME_WIDGET, ID_MODE_MYFINDER,
+    ID_TRAY_WHEN_EMPTY, ID_MAKE_ROOM, ID_FAR_LEFT, ID_PERCENT_SIGN, ID_RING_STYLE, ID_BEFORE_APPS, ID_CONNECTION_ICONS, ID_KEEP_MOUSE_LAST_KNOWN, ID_SHORT_RUNTIME_ALERT, ID_HOVER_CARD, ID_HOVER_CHART, ID_TRAY_DEVICE_ICONS, ID_ANIMATE_CHARGING, ID_TRACK_SINCE, ID_TRACK_AWAKE, ID_TRACK_EMPTY, ID_RUNTIME_WIDGET, ID_MODE_MYFINDER, ID_WINDHAWK_PILL,
     ID_PLACE_AUTO, ID_PLACE_TOP, ID_PLACE_TRAY, ID_PLACE_BOTTOM,  // "Position on a vertical taskbar"
     ID_POSITION_FIRST = 700,  // "Position on the taskbar": ID_POSITION_FIRST + 0..5, then the custom value
     ID_POLL_FIRST = 500,  // "Check battery every": ID_POLL_FIRST + 0..7
@@ -107,6 +107,7 @@ bool g_trayDeviceIcons = false;  // tray mode: device symbol + level bar instead
 bool g_runtimeWidget = false;  // optionally show estimated remaining hours instead of % in taskbar widget
 std::wstring g_widgetMonitor = L"all";  // which taskbars show the widget: "all", "main" or one monitor id
 bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
+bool g_windhawkPill = false;  // sit inside a Windhawk Taskbar Styler tray "pill" (fork option)
 bool g_stacked = false;      // icon above the percentage (menu option)
 bool g_showPercentSign = true;  // include '%' in taskbar battery labels (menu option)
 bool g_ringStyle = false;  // device icon inside a battery ring (menu option, PR #110)
@@ -1154,6 +1155,12 @@ void SetMode(bool useWidget) {
     Reconcile();
 }
 
+void SetWindhawkPill(bool on) {
+    g_windhawkPill = on;
+    SaveBoolSetting(L"WindhawkPill", on);
+    widget::SetWindhawkPill(on);
+}
+
 void SetWidgetBackground(bool on) {
     g_widgetBackground = on;
     SaveWidgetBackground(on);
@@ -1490,6 +1497,8 @@ void ShowMenu() {
     AppendMenuW(display, MF_SEPARATOR, 0, nullptr);
     UINT bgFlags = MF_STRING | (g_widgetBackground ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED);
     AppendMenuW(display, bgFlags, ID_WIDGET_BACKGROUND, T(L"Background behind taskbar text (for transparent taskbars)"));
+    AppendMenuW(display, MF_STRING | (g_windhawkPill ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_WINDHAWK_PILL,
+                T(L"Inside the Windhawk tray pill"));
     AppendMenuW(display, MF_STRING | (g_stacked ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_STACKED, T(L"Icons above percentages (narrower)"));
     AppendMenuW(display, MF_STRING | (g_showPercentSign ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_PERCENT_SIGN,
                 T(L"Show percent sign (%)"));
@@ -1693,6 +1702,7 @@ void ShowMenu() {
             break;
         case ID_RUNTIME_WIDGET: g_runtimeWidget = !g_runtimeWidget; SaveRuntimeWidget(g_runtimeWidget); UpdateWidget(); break;
         case ID_WIDGET_BACKGROUND: SetWidgetBackground(!g_widgetBackground); break;
+        case ID_WINDHAWK_PILL: SetWindhawkPill(!g_windhawkPill); break;
         case ID_MONITOR_ALL: SetWidgetMonitor(L"all"); break;
         case ID_LANG_AUTO: SetLanguage(L""); break;
         case ID_LANG_ADD: i18n::OpenUserFolder(); break;
@@ -2277,6 +2287,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_beforeApps = LoadBeforeApps() && !g_farLeft;
     widget::SetBeforeApps(g_beforeApps);
     widget::SetBackground(g_widgetBackground);  // remembered by the widget across re-creation
+    g_windhawkPill = LoadBoolSetting(L"WindhawkPill", false);
+    widget::SetWindhawkPill(g_windhawkPill);
     i18n::Init();
     g_widgetMonitor = LoadWidgetMonitor();
     widget::SetMonitorChoice(g_widgetMonitor);

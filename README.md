@@ -1,5 +1,9 @@
 # BatteryHub
 
+> **Windhawk modification (unofficial fork).** This fork of [BatteryHub](https://github.com/krisgfx9/Wireless-Device-Battery-Monitor) adds one option for taskbars restyled with Windhawk's *Windows 11 Taskbar Styler*: **Display settings → Inside the Windhawk tray pill**. The strip then sits inside the rounded notification-area "pill", just left of its first button (the ^ chevron), instead of left of the pill.
+>
+> The pill must have room for the strip. In the Taskbar Styler settings, add a left padding to the target `Grid#SystemTrayFrameGrid` (the element that draws the pill), for example `Padding=70,0,0,0`, and adjust the number to the strip's width. If your theme already sets a padding there, add to its first number instead. Turn off *Background behind taskbar text* so the pill shows through. *Position on the taskbar* fine-tunes the spot. Fork builds have official updates disabled, so the upstream updater never replaces this version.
+
 *Formerly **Wireless Battery**. Version 1.1.0 renamed the app; an update keeps your settings, startup choice and battery history.*
 
 [![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/krisgfx)

@@ -47,6 +47,8 @@ void SetCardOptions(bool card, bool chart);
 void SetLightTheme(bool light);
 // Draws a rounded plate in the taskbar's colours behind the text (kept across Create/Destroy).
 void SetBackground(bool on);
+// Inside a Windhawk Taskbar Styler "pill": left of the tray's first button instead of left of the tray (kept across Create/Destroy).
+void SetWindhawkPill(bool on);
 // Icon above the percentage instead of beside it, when the taskbar is tall enough (kept across Create/Destroy).
 void SetStacked(bool on);
 // Include '%' after numeric battery levels (kept across Create/Destroy).

@@ -22,6 +22,7 @@ Hide last known / asleep devices = Zuletzt bekannte / schlafende Geräte ausblen
 Show on the taskbar (icon + percentage) = In der Taskleiste anzeigen (Symbol + Prozent)
 Show as tray icons = Als Symbole im Infobereich anzeigen
 Background behind taskbar text (for transparent taskbars) = Hintergrund hinter dem Taskleistentext (für transparente Taskleisten)
+Inside the Windhawk tray pill = In der Windhawk-Infobereich-Pille
 Icons above percentages (narrower) = Symbole über den Prozentwerten (schmaler)
 All monitors = Alle Bildschirme
 Main monitor only = Nur Hauptbildschirm

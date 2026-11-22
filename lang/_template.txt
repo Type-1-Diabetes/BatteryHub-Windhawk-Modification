@@ -98,6 +98,7 @@ Show estimated time instead of % (when available) =
 Show on the taskbar (icon + percentage) = 
 Show as tray icons = 
 Background behind taskbar text (for transparent taskbars) = 
+Inside the Windhawk tray pill = 
 Icons above percentages (narrower) =
 Show percent sign (%) = 
 Ring style (icon inside a battery ring) = 
