@@ -109,6 +109,7 @@ std::wstring g_widgetMonitor = L"all";  // which taskbars show the widget: "all"
 bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
 bool g_windhawkPill = false;  // sit inside a Windhawk Taskbar Styler tray "pill" (fork option)
 bool g_cardAcrylic = false;  // hover card on a blurred, see-through Windows backdrop (fork option)
+std::vector<std::wstring> g_widgetKeys;  // device key of each item the strip shows, in its order (fork: left click)
 bool g_stacked = false;      // icon above the percentage (menu option)
 bool g_showPercentSign = true;  // include '%' in taskbar battery labels (menu option)
 bool g_ringStyle = false;  // device icon inside a battery ring (menu option, PR #110)
@@ -936,6 +937,7 @@ void UpdateWidget() {
     for (auto* e : list) labelIn.push_back({ e->st.kind, DisplayName(*e) });
     std::vector<std::wstring> labels = ShortLabels(labelIn, 3);
     std::vector<WidgetItem> items;
+    g_widgetKeys.clear();
     std::wstring tip;
     for (auto* e : list) {
         WidgetItem it;
@@ -988,6 +990,7 @@ void UpdateWidget() {
         if (g_hoverCard && g_hoverChart && g_recordHistory)
             for (const auto& pt : battery_history::Recent(e->st.key, 24)) it.trend.push_back({ pt.secondsAgo, pt.percent });
         items.push_back(it);
+        g_widgetKeys.push_back(e->st.key);
         if (!tip.empty()) tip += L"\n";
         tip += DisplayName(*e) + L": " + StatusText(*e);
     }
@@ -2012,9 +2015,20 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 case NIN_KEYSELECT: ShowMenu(); break;
             }
             return 0;
-        case WM_WIDGET_CLICK:
+        case WM_WIDGET_CLICK: {
+            // Left click on a device (fork): its battery history. Right click, or a click beside the
+            // devices: the menu, as before.
+            int item = (int)wp - 1;
+            if (lp == 1 && item >= 0 && item < (int)g_widgetKeys.size()) {
+                auto it = g_entries.find(g_widgetKeys[item]);
+                if (it != g_entries.end()) {
+                    battery_history::Show(g_hwnd, it->first, DisplayName(it->second));
+                    return 0;
+                }
+            }
             ShowMenu();
             return 0;
+        }
         case WM_ENDSESSION:  // sign-out / shutdown / installer restart manager
             if (wp) DestroyWindow(h);
             return 0;

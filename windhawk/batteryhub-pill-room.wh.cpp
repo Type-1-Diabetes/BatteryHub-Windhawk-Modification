@@ -2,7 +2,7 @@
 // @id              batteryhub-pill-room
 // @name            BatteryHub pill room
 // @description     Widens a Taskbar Styler tray "pill" by exactly the width of the BatteryHub strip
-// @version         1.2.0
+// @version         1.3.0
 // @author          BatteryHub Windhawk modification
 // @include         explorer.exe
 // @architecture    x86-64
@@ -56,6 +56,7 @@ Only the main taskbar is changed, the one BatteryHub sits inside.
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <atomic>
 #include <functional>
 #include <list>
@@ -316,6 +317,34 @@ int CurrentRoom() {
     return room > 0 ? std::max(0, room + g_extraRoom) : 0;
 }
 
+// The tray buttons' hover plate is Border#BackgroundBorder inside each button; themes such as Matter
+// reshape it (margin, corner radius). BatteryHub draws its own hover plate in the same shape, in
+// 96-DPI pixels from HKCU\Software\WirelessBattery: PillHoverInsetX / PillHoverInsetY / PillHoverRadius.
+void PublishHoverShape(FrameworkElement pill) {
+    auto border = FindDescendantByName(pill, L"BackgroundBorder").try_as<Controls::Border>();
+    if (!border) {
+        return;
+    }
+    Thickness margin = border.Margin();
+    CornerRadius corners = border.CornerRadius();
+    DWORD values[] = {(DWORD)std::clamp((int)std::lround(margin.Left), 0, 64),
+                      (DWORD)std::clamp((int)std::lround(margin.Top), 0, 64),
+                      (DWORD)std::clamp((int)std::lround(corners.TopLeft), 0, 64)};
+    static DWORD published[3] = {MAXDWORD, MAXDWORD, MAXDWORD};
+    if (!memcmp(values, published, sizeof(values))) {
+        return;
+    }
+    memcpy(published, values, sizeof(values));
+    const WCHAR* names[] = {L"PillHoverInsetX", L"PillHoverInsetY",
+                            L"PillHoverRadius"};
+    for (int i = 0; i < 3; i++) {
+        RegSetKeyValue(HKEY_CURRENT_USER, kRoomKey, names[i], REG_DWORD,
+                       &values[i], sizeof(values[i]));
+    }
+    Wh_Log(L"Tray hover plate: margin %u/%u, radius %u", values[0], values[1],
+           values[2]);
+}
+
 bool ApplyRoom(XamlRoot xamlRoot) {
     auto content = xamlRoot.Content().try_as<FrameworkElement>();
     if (!content) {
@@ -333,6 +362,8 @@ bool ApplyRoom(XamlRoot xamlRoot) {
         Wh_Log(L"SystemTrayFrameGrid not found");
         return false;
     }
+    PublishHoverShape(pill);
+
     FrameworkElement first = nullptr;
     EnumChildElements(pill, [&first](FrameworkElement child) {
         first = child;

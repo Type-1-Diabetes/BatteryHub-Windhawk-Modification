@@ -67,6 +67,10 @@ HoverFade g_hoverFade;
 // Level bars that glide to a new value, by device name: where the glide started and when.
 struct BarGlide { double from = -1, to = -1; ULONGLONG start = 0; };
 std::map<std::wstring, BarGlide> g_barGlides;
+// A device that just became fully charged glows once (fork): when it did, by device; and who was full.
+constexpr ULONGLONG kFullFlashMs = 900;
+std::map<std::wstring, ULONGLONG> g_fullFlash;
+std::map<std::wstring, bool> g_wasFull;
 
 struct Mirror {
     HWND bar = nullptr, wnd = nullptr;
@@ -336,6 +340,9 @@ int g_pillLeft = INT_MIN;    // guarded by g_wbLock: screen x of the tray's left
 int g_pillTop, g_pillBottom; // guarded by g_wbLock: screen y span of that button (its hover highlight)
 bool g_inPill;               // UI thread: the strip sat inside the pill on the last placement
 int g_hoverTop = -1, g_hoverBottom = -1;  // UI thread: hover plate rows in the strip, -1 = default inset
+// Shape of the tray buttons' own hover plate inside the pill, in pixels, as the "BatteryHub pill room"
+// Windhawk mod reads it from the taskbar (the theme's margin and corner radius of Border#BackgroundBorder).
+int g_hoverSide = -1, g_hoverRadius = -1;
 // Room the strip needs inside the pill, in 96-DPI pixels, published for the "BatteryHub pill room"
 // Windhawk mod (windhawk/batteryhub-pill-room.wh.cpp). The mod widens the pill's left padding by this
 // much, so the pill grows and shrinks with the strip. 0 = no room needed. -1 = not published yet.
@@ -908,6 +915,16 @@ double GlideValue(const BarGlide& g, ULONGLONG now) {
     return g.from + (g.to - g.from) * (1 - (1 - t) * (1 - t) * (1 - t));  // ease-out
 }
 
+// A device's identity across updates, for its animations (bar glide, full-charge glow).
+std::wstring FlashKey(const WidgetItem& it) { return it.name + L"|" + std::to_wstring((int)it.kind); }
+
+bool FlashRunning() {
+    const ULONGLONG now = GetTickCount64();
+    for (const auto& kv : g_fullFlash)
+        if (now - kv.second < kFullFlashMs) return true;
+    return false;
+}
+
 int GlidingBar(const std::wstring& key, int pct) {
     auto& g = g_barGlides[key];
     const ULONGLONG now = GetTickCount64();
@@ -984,7 +1001,7 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
         std::wstring t = !it.text.empty() ? it.text : it.percent >= 0 ? std::to_wstring(it.percent) + (g_showPercentSign ? L"%" : L"") : L"?";
         Piece label{ RenderMask(t, text, g_light), tc, a, mark || link ? Px(2) : 0 };
         if (branded && it.percent >= 0) {
-            label.barPct = GlidingBar(it.name + L"|" + std::to_wstring((int)it.kind), it.percent);
+            label.barPct = GlidingBar(FlashKey(it), it.percent);
             label.barColor = it.low ? red : warn ? amber : accent;
         }
         out.push_back(std::move(label));
@@ -1172,12 +1189,15 @@ bool PaintStrip(HWND wnd, HWND taskbar, bool hover, int hoverItem, const HoverFa
     // Hover plate (fork): under the device the mouse is on, like the tray's own buttons, and fading out
     // over kHoverFadeMs when the mouse moves on. Inside a Windhawk pill it takes the tray button's height.
     if (!g_myFinder) {
+        // Windows 11's own hover fill for tray buttons (SubtleFillColorSecondary): white at 6% on a dark
+        // taskbar, black at 4% on a light one. Themes such as Matter keep it and only reshape the plate.
         Rgb hoverColor = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
-        const int hoverAlpha = g_light ? 20 : 26;
+        const int hoverAlpha = g_light ? 9 : 15;
         const bool pillBand = wnd == g_wnd && g_inPill && g_hoverTop >= 0 && g_hoverBottom <= H && g_hoverBottom - g_hoverTop > Px(8);
-        auto plate = [&](RECT r, int alpha) {
+        auto plate = [&](RECT r, int alpha, Rgb color) {
             if (alpha <= 0) return;
-            int side = Px(2), rad = Px(4);
+            int side = pillBand && g_hoverSide >= 0 ? g_hoverSide : Px(2);
+            int rad = pillBand && g_hoverRadius >= 0 ? g_hoverRadius : Px(4);
             int left = r.left + side, right = r.right - side, top, bottom;
             if (g_vertical) { top = r.top + side; bottom = r.bottom - side; }
             else if (pillBand) { top = g_hoverTop; bottom = g_hoverBottom; }
@@ -1188,15 +1208,24 @@ bool PaintStrip(HWND wnd, HWND taskbar, bool hover, int hoverItem, const HoverFa
                 for (int xx = left; xx < right; xx++) {
                     int dx = xx < left + rad ? left + rad - xx : (xx >= right - rad ? xx - (right - rad - 1) : 0);
                     int dy = y < top + rad ? top + rad - y : (y >= bottom - rad ? y - (bottom - rad - 1) : 0);
-                    if (dx * dx + dy * dy <= rad * rad) cv.Blend(xx, y, hoverColor, alpha);
+                    if (dx * dx + dy * dy <= rad * rad) cv.Blend(xx, y, color, alpha);
                 }
         };
         auto rectOf = [&](int k) { return k >= 0 && k < (int)itemRects.size() ? itemRects[k] : RECT{}; };
-        if (hover && hoverItem >= 0 && hoverItem < (int)itemRects.size()) plate(rectOf(hoverItem), hoverAlpha);
-        else if (hover && itemRects.empty()) plate(RECT{ 0, 0, W, H }, hoverAlpha);  // no devices: the whole strip
+        if (hover && hoverItem >= 0 && hoverItem < (int)itemRects.size()) plate(rectOf(hoverItem), hoverAlpha, hoverColor);
+        else if (hover && itemRects.empty()) plate(RECT{ 0, 0, W, H }, hoverAlpha, hoverColor);  // no devices: the whole strip
         if (fade.item >= 0 && fade.item != (hover ? hoverItem : -1)) {
             ULONGLONG age = GetTickCount64() - fade.start;
-            if (age < kHoverFadeMs) plate(rectOf(fade.item), (int)(hoverAlpha * (kHoverFadeMs - age) / kHoverFadeMs));
+            if (age < kHoverFadeMs) plate(rectOf(fade.item), (int)(hoverAlpha * (kHoverFadeMs - age) / kHoverFadeMs), hoverColor);
+        }
+        // Just fully charged: a green glow swells and fades once under the device (fork).
+        const ULONGLONG now = GetTickCount64();
+        for (size_t k = 0; k < g_items.size() && k < itemRects.size(); k++) {
+            auto f = g_fullFlash.find(FlashKey(g_items[k]));
+            if (f == g_fullFlash.end() || now - f->second >= kFullFlashMs) continue;
+            double t = (now - f->second) / (double)kFullFlashMs;
+            Rgb green = g_light ? Rgb{ 16, 124, 16 } : Rgb{ 108, 203, 95 };
+            plate(itemRects[k], (int)((g_light ? 60 : 80) * std::sin(t * 3.14159265)), green);
         }
     }
 
@@ -1782,6 +1811,8 @@ void ShowCard(HWND strip, int item) {
     HFONT body = MakeFont(Px(12), FW_NORMAL, L"Segoe UI Variable Text", L"Segoe UI");
     HFONT small = MakeFont(Px(11), FW_NORMAL, L"Segoe UI Variable Text", L"Segoe UI");
     Rgb amber = g_light ? Rgb{ 157, 93, 0 } : Rgb{ 242, 179, 61 };
+    // The chart's labels are small type: a step brighter than the grey secondary text so they stay legible.
+    Rgb axisText = g_light ? Rgb{ 64, 64, 64 } : Rgb{ 208, 208, 208 };
 
     const int pad = Px(16), minW = Px(260), maxW = Px(380), textMax = maxW - 2 * pad;
     struct Line { Mask m; Rgb c; int x, y; bool right = false; };  // right: aligned to the card's right edge
@@ -1886,8 +1917,8 @@ void ShowCard(HWND strip, int item) {
             if (forecastHours > 0) axisEnd = RenderLine(!it.emptyAtText.empty() ? it.emptyAtText : it.hoursLeftText, body);
             Mask top = RenderLine(L"100%", small), bottom = RenderLine(L"0%", small);
             yLabelW = std::max(top.w, bottom.w) + Px(6);
-            lines.push_back({ std::move(top), sub, pad, chartY - top.h / 2 });
-            lines.push_back({ std::move(bottom), sub, pad + yLabelW - Px(6) - bottom.w, chartY + Px(56) - 1 - bottom.h / 2 });
+            lines.push_back({ std::move(top), axisText, pad, chartY - top.h / 2 });
+            lines.push_back({ std::move(bottom), axisText, pad + yLabelW - Px(6) - bottom.w, chartY + Px(56) - 1 - bottom.h / 2 });
             axisY = y;
             y += axisLeft.h;
         }
@@ -1973,12 +2004,12 @@ void ShowCard(HWND strip, int item) {
         }
         disc(X(0), Y(chartNow), Px(2) + 1, 255);  // the current level
         // axis labels: "24h ago" at the left, "Now" under the marker, the time to empty at the right
-        lines.push_back({ std::move(axisLeft), sub, cx, axisY });
+        lines.push_back({ std::move(axisLeft), axisText, cx, axisY });
         int nowLabelX = std::max(cx, std::min(nowX - axisNow.w / 2, cx + cw - axisNow.w));
         if (future > 0) nowLabelX = std::max(nowLabelX, cx + lines.back().m.w + Px(6));
         int endX = cx + cw - axisEnd.w;
         if (future > 0 && axisEnd.w > 0) nowLabelX = std::min(nowLabelX, endX - axisNow.w - Px(6));
-        if (future > 0 || nowX > cx + lines.back().m.w + Px(6)) lines.push_back({ std::move(axisNow), sub, nowLabelX, axisY });
+        if (future > 0 || nowX > cx + lines.back().m.w + Px(6)) lines.push_back({ std::move(axisNow), axisText, nowLabelX, axisY });
         if (future > 0 && axisEnd.w > 0) lines.push_back({ std::move(axisEnd), fg, endX, axisY });
     }
     if (chip.right > chip.left) {  // outline of the connection label
@@ -2093,7 +2124,7 @@ bool MotionRunning() {
     const ULONGLONG now = GetTickCount64();
     bool fading = g_hoverFade.item >= 0 && now - g_hoverFade.start < kHoverFadeMs;
     for (const auto& m : g_mirrors) fading |= m.fade.item >= 0 && now - m.fade.start < kHoverFadeMs;
-    return fading || BarsGliding();
+    return fading || BarsGliding() || FlashRunning();
 }
 
 void StartMotion() {
@@ -2254,7 +2285,12 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g_pressed = false;
             if (dragged) Drop(h);  // a drag is not a click
             if (msg == WM_LBUTTONUP && GetCapture() == h) ReleaseCapture();
-            if (!dragged) PostMessageW(g_notify, g_clickMsg, 0, 0);
+            if (!dragged) {
+                // wParam: the device under the mouse + 1 (0 = none); lParam: 1 for a left click.
+                POINT p{ (short)LOWORD(lp), (short)HIWORD(lp) };
+                int k = ItemAt(h, p);
+                PostMessageW(g_notify, g_clickMsg, k >= 0 ? (WPARAM)(k + 1) : 0, msg == WM_LBUTTONUP ? 1 : 0);
+            }
             return 0;
         }
         case WM_MOUSEACTIVATE:
@@ -2426,6 +2462,13 @@ void SetAnimateCharging(bool on) {
 
 void SetItems(const std::vector<WidgetItem>& items, const std::wstring& tooltip) {
     g_items = items;
+    // Fully charged since the last update: glow once (not on the first sight of a device, e.g. at start).
+    for (const auto& it : g_items) {
+        std::wstring key = FlashKey(it);
+        auto was = g_wasFull.find(key);
+        if (was != g_wasFull.end() && !was->second && it.full && MotionOn()) g_fullFlash[key] = GetTickCount64();
+        g_wasFull[key] = it.full;
+    }
     if (tooltip != g_tipText) {
         g_tipText = tooltip;
         if (g_wnd) SetSummary(g_wnd);
@@ -2434,7 +2477,7 @@ void SetItems(const std::vector<WidgetItem>& items, const std::wstring& tooltip)
     PaintAll();
     Reposition();
     UpdateChargeTimer();
-    if (BarsGliding()) StartMotion();
+    if (BarsGliding() || FlashRunning()) StartMotion();
     if (g_cardItem != -1 && g_cardStrip && IsWindow(g_cardStrip)) {  // keep an open card up to date
         if (g_cardItem == kCardMessage ? g_items.empty() : g_cardItem < (int)g_items.size()) ShowCard(g_cardStrip, g_cardItem);
         else HideCard();
@@ -2634,6 +2677,9 @@ bool Reposition() {
     if (!Alive()) return false;
     if (g_dragging) return true;  // the mouse places the strip until the drop
     SyncMirrors();
+    // No strip in the main taskbar's pill (another monitor shows it, or MyDockFinder hosts it): the pill
+    // room mod gives the room back.
+    if (g_primaryHidden || g_myFinder) PublishPillRoom(0);
     if (g_primaryHidden) return true;  // only another monitor's taskbar shows the strip
     if (g_myFinder) {
         if (Dpi() != g_lastDpi) { g_lastDpi = Dpi(); Paint(); }
@@ -2704,6 +2750,7 @@ bool Reposition() {
     if (tr.right <= bar.left || tr.left >= bar.right || tr.bottom <= bar.top || tr.top >= bar.bottom)
         return true;
     if (g_vertical) {
+        PublishPillRoom(0);  // the pill option is for horizontal taskbars
         // Left or right taskbar (PR #321): the column sits just above the notification area, centred in
         // the bar's width.
         POINT anchor{ bar.left, StepPastOtherWidgets(tr.top, bar, true, false) };
@@ -2786,6 +2833,24 @@ bool Reposition() {
             if (pillTop >= bar.top && pillBottom <= bar.bottom && pillBottom > pillTop) {
                 hoverTop = pillTop - bar.top;  // the strip spans the bar's height from its top
                 hoverBottom = pillBottom - bar.top;
+                // The tray button's visible hover plate sits inside its bounds by the theme's margin
+                // (Matter: 5 px above and below, 2 px at the sides) with the theme's corner radius.
+                auto modValue = [](const wchar_t* name, DWORD fallback) {
+                    DWORD v = fallback, size = sizeof(v);
+                    RegGetValueW(HKEY_CURRENT_USER, L"Software\\WirelessBattery", name, RRF_RT_REG_DWORD, nullptr, &v, &size);
+                    return (int)std::min<DWORD>(v, 64);
+                };
+                int insetY = Px(modValue(L"PillHoverInsetY", 0));
+                if (hoverBottom - hoverTop - 2 * insetY > Px(8)) {
+                    hoverTop += insetY;
+                    hoverBottom -= insetY;
+                }
+                int side = Px(modValue(L"PillHoverInsetX", 2)), radius = Px(modValue(L"PillHoverRadius", 4));
+                if (side != g_hoverSide || radius != g_hoverRadius) {
+                    g_hoverSide = side;
+                    g_hoverRadius = radius;
+                    if (g_hover) Paint();
+                }
             }
         }
     }
