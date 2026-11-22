@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <map>
 
 namespace {
 
@@ -53,9 +54,25 @@ ULONGLONG g_lastValidFinderPlacement = 0;
 // Copies of the strip on secondary-monitor taskbars (Shell_SecondaryTrayWnd), so the levels stay visible
 // while a game runs fullscreen on the main screen. Same drawing, same click and tooltip; each one sits
 // left of its taskbar's clock. The primary strip above is unchanged, and with one monitor none exist.
+// Motion (fork): the hover plate fades out instead of vanishing, level bars glide to a new value and the
+// hover card fades and slides. All of it is skipped when Windows' "Animation effects" are off.
+bool MotionOn() {
+    BOOL on = TRUE;
+    return !SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0) || on;
+}
+constexpr ULONGLONG kHoverFadeMs = 120, kBarGlideMs = 300;
+struct HoverFade { int item = -1; ULONGLONG start = 0; };  // the device whose plate is fading out
+int g_hoverAt = -1;  // device under the mouse on the primary strip (its hover plate), -1 = none
+HoverFade g_hoverFade;
+// Level bars that glide to a new value, by device name: where the glide started and when.
+struct BarGlide { double from = -1, to = -1; ULONGLONG start = 0; };
+std::map<std::wstring, BarGlide> g_barGlides;
+
 struct Mirror {
     HWND bar = nullptr, wnd = nullptr;
     bool hover = false;
+    int hoverItem = -1;  // device under the mouse, -1 = none
+    HoverFade fade;
     bool painted = false;
     SIZE size{};
     int dpi = 0;
@@ -323,14 +340,17 @@ int g_hoverTop = -1, g_hoverBottom = -1;  // UI thread: hover plate rows in the 
 // Windhawk mod (windhawk/batteryhub-pill-room.wh.cpp). The mod widens the pill's left padding by this
 // much, so the pill grows and shrinks with the strip. 0 = no room needed. -1 = not published yet.
 int g_publishedPillRoom = -1;
+constexpr UINT_PTR kPillRemeasureTimer = 6;
 
 void PublishPillRoom(int room) {
     if (room == g_publishedPillRoom) return;
     g_publishedPillRoom = room;
     DWORD v = (DWORD)room;
     RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\WirelessBattery", L"PillRoom", REG_DWORD, &v, sizeof(v));
-    // The tray buttons move once the mod has applied the padding: measure them again soon.
+    // The tray buttons move once the mod has applied the padding, and it grows the pill over ~150 ms:
+    // measure them now and once more when that has settled.
     if (g_wbWake) SetEvent(g_wbWake);
+    if (g_wnd) SetTimer(g_wnd, kPillRemeasureTimer, 300, nullptr);
 }
 
 IUIAutomationCondition* StringCondition(IUIAutomation* uia, PROPERTYID prop, const wchar_t* value) {
@@ -880,11 +900,35 @@ void RingMasks(int d, double stroke, double fraction, Mask& track, Mask& arc) {
 //    used only when the taskbar is tall enough, otherwise the normal row
 //  * vertical (left / right taskbar, from PR #321): one device per row block, stacked top to bottom
 // `width` and `height` return the strip's size; in the vertical layout the width is the bar's.
+// The bar value to draw now for a device whose level is `pct`: glides from the last value to the new one
+// over kBarGlideMs (fork). The first value of a device is drawn as it is.
+double GlideValue(const BarGlide& g, ULONGLONG now) {
+    if (now - g.start >= kBarGlideMs) return g.to;
+    double t = (now - g.start) / (double)kBarGlideMs;
+    return g.from + (g.to - g.from) * (1 - (1 - t) * (1 - t) * (1 - t));  // ease-out
+}
+
+int GlidingBar(const std::wstring& key, int pct) {
+    auto& g = g_barGlides[key];
+    const ULONGLONG now = GetTickCount64();
+    if (g.to < 0 || !MotionOn()) g = { (double)pct, (double)pct, now };
+    else if (pct != (int)std::lround(g.to)) g = { GlideValue(g, now), (double)pct, now };
+    return (int)std::lround(GlideValue(g, now));
+}
+
+bool BarsGliding() {
+    const ULONGLONG now = GetTickCount64();
+    for (const auto& kv : g_barGlides)
+        if (kv.second.from != kv.second.to && now - kv.second.start < kBarGlideMs) return true;
+    return false;
+}
+
 std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
     Rgb fg = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
     Rgb red = g_light ? Rgb{ 196, 30, 40 } : Rgb{ 255, 90, 90 };
     Rgb charge = g_light ? Rgb{ 0, 120, 212 } : Rgb{ 96, 205, 255 };
     Rgb full = g_light ? Rgb{ 16, 124, 16 } : Rgb{ 108, 203, 95 };  // Windows "success" green
+    Rgb amber = g_light ? Rgb{ 157, 93, 0 } : Rgb{ 242, 179, 61 };  // getting low, before the red "low" (fork)
     HFONT icons = MakeFont(Px(16), FW_NORMAL, L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
     HFONT bolt = MakeFont(Px(11), FW_NORMAL, L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
     HFONT text = MakeFont(Px(13), FW_NORMAL, L"Segoe UI Variable Text", L"Segoe UI", Px(12));
@@ -900,6 +944,8 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
     for (size_t i = 0; i < g_items.size(); i++) {
         const auto& it = g_items[i];
         int a = it.dim ? 120 : 255;
+        // Under 25% and not yet "low": amber, so a battery that needs charging soon shows at a glance.
+        const bool warn = !it.low && !it.charging && !it.full && it.percent >= 0 && it.percent < 25;
         if (ring) {
             // The arc is the charge: red when low, blue while charging; the faint full circle is the track.
             int d = Px(28);
@@ -908,7 +954,7 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
             RingMasks(d, std::max(2.0, d / 13.0), it.percent >= 0 ? it.percent / 100.0 : 0.0, track, arc);
             int base = (int)out.size();
             out.push_back({ std::move(track), fg, a * (g_light ? 45 : 60) / 255, i + 1 < g_items.size() ? Px(8) : 0 });
-            Piece arcPiece{ std::move(arc), it.charging ? charge : it.low ? red : fg, a, 0 };
+            Piece arcPiece{ std::move(arc), it.charging ? charge : it.low ? red : warn ? amber : fg, a, 0 };
             arcPiece.anchor = base;
             out.push_back(std::move(arcPiece));
             Piece glyph{ RenderMask(std::wstring(1, Glyph(it.kind, it.bluetooth)), ringIcons, g_light), fg, a, 0 };
@@ -919,7 +965,7 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
             for (size_t k = (size_t)base; k < out.size(); k++) out[k].item = (int)i;  // the hover card finds it
             continue;
         }
-        Rgb tc = it.low ? red : fg;
+        Rgb tc = it.low ? red : warn ? amber : fg;
         bool mark = it.charging || it.full;  // bolt while charging, green check mark once full
         bool link = !mark && g_connectionIcons && it.wirelessLink;  // wireless mark otherwise (opt-in)
         size_t glyph = out.size();
@@ -938,8 +984,8 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
         std::wstring t = !it.text.empty() ? it.text : it.percent >= 0 ? std::to_wstring(it.percent) + (g_showPercentSign ? L"%" : L"") : L"?";
         Piece label{ RenderMask(t, text, g_light), tc, a, mark || link ? Px(2) : 0 };
         if (branded && it.percent >= 0) {
-            label.barPct = it.percent;
-            label.barColor = it.low ? red : accent;
+            label.barPct = GlidingBar(it.name + L"|" + std::to_wstring((int)it.kind), it.percent);
+            label.barColor = it.low ? red : warn ? amber : accent;
         }
         out.push_back(std::move(label));
         if (mark) out.push_back({ RenderMask(std::wstring(1, it.full ? kCheck : kBolt), bolt, g_light), it.full ? full : charge, a, 0 });
@@ -1037,7 +1083,8 @@ std::vector<RECT> g_itemRects;
 
 // Draws the strip for one window: the primary one or a mirror on a secondary taskbar.
 // Returns true only when the layered surface was updated with a valid non-empty size.
-bool PaintStrip(HWND wnd, HWND taskbar, bool hover, SIZE& size, std::vector<RECT>& itemRects) {
+bool PaintStrip(HWND wnd, HWND taskbar, bool hover, int hoverItem, const HoverFade& fade, SIZE& size,
+                std::vector<RECT>& itemRects) {
     if (!wnd || !taskbar || !IsWindow(wnd) || !IsWindow(taskbar)) return false;
     RECT bar{};
     if (!GetClientRect(taskbar, &bar)) return false;
@@ -1068,67 +1115,28 @@ bool PaintStrip(HWND wnd, HWND taskbar, bool hover, SIZE& size, std::vector<RECT
     // (e.g. Windhawk's Taskbar Styler) makes the bar transparent over the wallpaper.
     Rgb barColor = g_light ? Rgb{ 243, 243, 243 } : Rgb{ 32, 32, 32 };
     if (g_background && !g_myFinder) roundRect(Px(4), Px(6), barColor, 240);
-    Rgb hoverColor = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
-    int hoverAlpha = g_light ? 20 : 26;
-    if (hover && !g_myFinder && wnd == g_wnd && g_inPill && g_hoverTop >= 0 && g_hoverBottom <= H &&
-        g_hoverBottom - g_hoverTop > Px(8)) {
-        // Inside a Windhawk pill: the height and corners of the tray's own button highlight, so the
-        // plate stays within the pill instead of spilling over its rounded edge.
-        int r = Px(4), top = g_hoverTop, bottom = g_hoverBottom, side = Px(2);
-        for (int y = top; y < bottom; y++)
-            for (int x = side; x < W - side; x++) {
-                int dx = x < side + r ? side + r - x : (x >= W - side - r ? x - (W - side - r - 1) : 0);
-                int dy = y < top + r ? top + r - y : (y >= bottom - r ? y - (bottom - r - 1) : 0);
-                if (dx * dx + dy * dy <= r * r) cv.Blend(x, y, hoverColor, hoverAlpha);
-            }
-    } else if (hover && !g_myFinder) {
-        roundRect(Px(4), Px(4), hoverColor, hoverAlpha);
-    }
-
     int x = Px(8);
     Rgb track = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
+    // Where each piece goes, first: the hover plate sits under the device, so it is drawn before the pieces.
     std::vector<int> xs(pieces.size()), ys(pieces.size());
+    const int barH = std::max(2, Px(2)), barGap = Px(3);
     for (size_t i = 0; i < pieces.size(); i++) {
         const Piece& p = pieces[i];
         if (p.anchor < 0) {
             bool fixed = p.px != INT_MIN;  // stacked / vertical layout: Layout() placed it
             xs[i] = fixed ? p.px : x;
             ys[i] = fixed ? p.py : (H - p.m.h) / 2;
-            if (p.haloR) cv.Draw(p.halo, xs[i] - p.haloR, ys[i] - p.haloR, p.color, p.haloAlpha * p.alpha / 255);
-            if (p.barPct >= 0) {
-                // The bar spans the text's width, like Synapse's battery bar; in the row layout text and bar
-                // are centred together.
-                int bh = std::max(2, Px(2)), gap = Px(3);
-                if (!fixed) ys[i] = (H - (p.m.h + gap + bh)) / 2;
-                int by = ys[i] + p.m.h + gap;
-                int fill = std::max(p.barPct > 0 ? 1 : 0, (p.barPct * p.m.w + 50) / 100);
-                for (int yy = by; yy < by + bh; yy++)
-                    for (int xx = 0; xx < p.m.w; xx++)
-                        cv.Blend(xs[i] + xx, yy, xx < fill ? p.barColor : track, xx < fill ? p.alpha : 45 * p.alpha / 255);
-            }
+            // The bar spans the text's width, like Synapse's battery bar; in the row layout text and bar
+            // are centred together.
+            if (p.barPct >= 0 && !fixed) ys[i] = (H - (p.m.h + barGap + barH)) / 2;
             if (!fixed) x += p.m.w + p.gapAfter;
-        } else {  // caption: one-pixel outline in the taskbar's colour so it reads over the icon's lines
+        } else {
             xs[i] = xs[p.anchor] + p.bx;
             ys[i] = ys[p.anchor] + p.by;
-            for (int oy = -1; oy <= 1; oy++)
-                for (int ox = -1; ox <= 1; ox++)
-                    if (ox || oy) cv.Draw(p.m, xs[i] + ox, ys[i] + oy, barColor, 255);
-        }
-        if (p.charging) {
-            // Green fills the icon bottom to top, then drains from the bottom: a 2.4 s loop that ignores the
-            // level (the percentage and bar show that). The empty part stays in the normal colour, a bit dimmer.
-            Rgb green = g_light ? Rgb{ 0, 160, 40 } : Rgb{ 30, 230, 80 };
-            double t = (GetTickCount64() % 2400) / 2400.0;
-            int head = t < 0.5 ? (int)(p.m.h * t * 2) : p.m.h;
-            int tail = t < 0.5 ? 0 : (int)(p.m.h * (t - 0.5) * 2);
-            cv.Draw(p.m, xs[i], ys[i], p.color, p.alpha * 80 / 100);
-            cv.Draw(p.m, xs[i], ys[i], green, p.alpha, p.m.h - tail, p.m.h - head);
-        } else {
-            cv.Draw(p.m, xs[i], ys[i], p.color, p.alpha);
         }
     }
 
-    // Where each device sits, for the hover card: the span of its pieces, widened to meet its neighbours.
+    // Where each device sits, for the hover card and plate: the span of its pieces, widened to meet its neighbours.
     itemRects.assign(g_items.size(), RECT{ INT_MAX, INT_MAX, INT_MIN, INT_MIN });
     for (size_t i = 0; i < pieces.size(); i++) {
         int k = pieces[i].item;
@@ -1159,6 +1167,67 @@ bool PaintStrip(HWND wnd, HWND taskbar, bool hover, SIZE& size, std::vector<RECT
     if (!itemRects.empty()) {
         if (g_vertical) itemRects.back().bottom = H;
         else itemRects.back().right = W;
+    }
+
+    // Hover plate (fork): under the device the mouse is on, like the tray's own buttons, and fading out
+    // over kHoverFadeMs when the mouse moves on. Inside a Windhawk pill it takes the tray button's height.
+    if (!g_myFinder) {
+        Rgb hoverColor = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
+        const int hoverAlpha = g_light ? 20 : 26;
+        const bool pillBand = wnd == g_wnd && g_inPill && g_hoverTop >= 0 && g_hoverBottom <= H && g_hoverBottom - g_hoverTop > Px(8);
+        auto plate = [&](RECT r, int alpha) {
+            if (alpha <= 0) return;
+            int side = Px(2), rad = Px(4);
+            int left = r.left + side, right = r.right - side, top, bottom;
+            if (g_vertical) { top = r.top + side; bottom = r.bottom - side; }
+            else if (pillBand) { top = g_hoverTop; bottom = g_hoverBottom; }
+            else { top = Px(4); bottom = H - Px(4); }
+            left = std::max(0, left);
+            right = std::min(W, right);
+            for (int y = std::max(0, top); y < std::min(H, bottom); y++)
+                for (int xx = left; xx < right; xx++) {
+                    int dx = xx < left + rad ? left + rad - xx : (xx >= right - rad ? xx - (right - rad - 1) : 0);
+                    int dy = y < top + rad ? top + rad - y : (y >= bottom - rad ? y - (bottom - rad - 1) : 0);
+                    if (dx * dx + dy * dy <= rad * rad) cv.Blend(xx, y, hoverColor, alpha);
+                }
+        };
+        auto rectOf = [&](int k) { return k >= 0 && k < (int)itemRects.size() ? itemRects[k] : RECT{}; };
+        if (hover && hoverItem >= 0 && hoverItem < (int)itemRects.size()) plate(rectOf(hoverItem), hoverAlpha);
+        else if (hover && itemRects.empty()) plate(RECT{ 0, 0, W, H }, hoverAlpha);  // no devices: the whole strip
+        if (fade.item >= 0 && fade.item != (hover ? hoverItem : -1)) {
+            ULONGLONG age = GetTickCount64() - fade.start;
+            if (age < kHoverFadeMs) plate(rectOf(fade.item), (int)(hoverAlpha * (kHoverFadeMs - age) / kHoverFadeMs));
+        }
+    }
+
+    for (size_t i = 0; i < pieces.size(); i++) {
+        const Piece& p = pieces[i];
+        if (p.anchor < 0) {
+            if (p.haloR) cv.Draw(p.halo, xs[i] - p.haloR, ys[i] - p.haloR, p.color, p.haloAlpha * p.alpha / 255);
+            if (p.barPct >= 0) {
+                int by = ys[i] + p.m.h + barGap;
+                int fill = std::max(p.barPct > 0 ? 1 : 0, (p.barPct * p.m.w + 50) / 100);
+                for (int yy = by; yy < by + barH; yy++)
+                    for (int xx = 0; xx < p.m.w; xx++)
+                        cv.Blend(xs[i] + xx, yy, xx < fill ? p.barColor : track, xx < fill ? p.alpha : 45 * p.alpha / 255);
+            }
+        } else {  // caption: one-pixel outline in the taskbar's colour so it reads over the icon's lines
+            for (int oy = -1; oy <= 1; oy++)
+                for (int ox = -1; ox <= 1; ox++)
+                    if (ox || oy) cv.Draw(p.m, xs[i] + ox, ys[i] + oy, barColor, 255);
+        }
+        if (p.charging) {
+            // Green fills the icon bottom to top, then drains from the bottom: a 2.4 s loop that ignores the
+            // level (the percentage and bar show that). The empty part stays in the normal colour, a bit dimmer.
+            Rgb green = g_light ? Rgb{ 0, 160, 40 } : Rgb{ 30, 230, 80 };
+            double t = (GetTickCount64() % 2400) / 2400.0;
+            int head = t < 0.5 ? (int)(p.m.h * t * 2) : p.m.h;
+            int tail = t < 0.5 ? 0 : (int)(p.m.h * (t - 0.5) * 2);
+            cv.Draw(p.m, xs[i], ys[i], p.color, p.alpha * 80 / 100);
+            cv.Draw(p.m, xs[i], ys[i], green, p.alpha, p.m.h - tail, p.m.h - head);
+        } else {
+            cv.Draw(p.m, xs[i], ys[i], p.color, p.alpha);
+        }
     }
 
     if (g_myFinder && wnd == g_wnd) {
@@ -1208,7 +1277,7 @@ bool PaintStrip(HWND wnd, HWND taskbar, bool hover, SIZE& size, std::vector<RECT
 void Paint() {
     if (!g_wnd) return;
     RECT client{};
-    g_painted = PaintStrip(g_wnd, g_taskbar, g_hover, g_size, g_itemRects);
+    g_painted = PaintStrip(g_wnd, g_taskbar, g_hover, g_hoverAt, g_hoverFade, g_size, g_itemRects);
     if (g_painted && GetClientRect(g_taskbar, &client)) {
         g_paintedBarClient = { client.right - client.left, client.bottom - client.top };
     } else {
@@ -1221,7 +1290,7 @@ void Paint() {
 void PaintMirror(Mirror& m) {
     g_dpiBar = m.bar;
     m.dpi = Dpi();
-    m.painted = PaintStrip(m.wnd, m.bar, m.hover, m.size, m.itemRects);
+    m.painted = PaintStrip(m.wnd, m.bar, m.hover, m.hoverItem, m.fade, m.size, m.itemRects);
     if (!m.painted) m.size = {};
     g_dpiBar = nullptr;
     m.lastLeft = INT_MIN;  // force a re-position with the new size
@@ -1606,9 +1675,74 @@ void FillRound(Canvas& cv, int x0, int y0, int w, int h, int r, Rgb c, int alpha
         }
 }
 
+// Card motion (fork): it fades in while rising a few pixels away from the taskbar, glides when the mouse
+// moves to the next device, and fades out. Each frame only moves the layered window and changes its
+// overall alpha; the picture itself is drawn once per ShowCard().
+bool g_cardAcrylic = false;  // see-through blurred backdrop (menu option)
+struct CardMotion {
+    int fromX = 0, fromY = 0, toX = 0, toY = 0;
+    int fromA = 255, toA = 255;
+    ULONGLONG start = 0, duration = 0;
+    bool hideAtEnd = false, running = false;
+};
+CardMotion g_cardMotion;
+int g_cardX = 0, g_cardY = 0, g_cardA = 0;  // where the card is now and its overall alpha
+constexpr UINT_PTR kCardMotionTimer = 1;
+
+void PlaceCard(int x, int y, int alpha) {
+    g_cardX = x;
+    g_cardY = y;
+    g_cardA = alpha;
+    POINT dst{ x, y };
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, (BYTE)std::clamp(alpha, 0, 255), AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_card, nullptr, &dst, nullptr, nullptr, nullptr, 0, &bf, ULW_ALPHA);
+}
+
+void CALLBACK CardMotionTick(HWND, UINT, UINT_PTR, DWORD) {
+    CardMotion& m = g_cardMotion;
+    if (!g_card || !m.running) return;
+    ULONGLONG age = GetTickCount64() - m.start;
+    double t = m.duration ? std::min(1.0, age / (double)m.duration) : 1.0;
+    double e = 1 - std::pow(1 - t, 4);  // fast start, soft landing
+    PlaceCard((int)std::lround(m.fromX + (m.toX - m.fromX) * e), (int)std::lround(m.fromY + (m.toY - m.fromY) * e),
+              (int)std::lround(m.fromA + (m.toA - m.fromA) * e));
+    if (t >= 1) {
+        m.running = false;
+        KillTimer(g_card, kCardMotionTimer);
+        if (m.hideAtEnd) ShowWindow(g_card, SW_HIDE);
+    }
+}
+
+void AnimateCard(int toX, int toY, int toA, ULONGLONG duration, bool hideAtEnd) {
+    g_cardMotion = { g_cardX, g_cardY, toX, toY, g_cardA, toA, GetTickCount64(), duration, hideAtEnd, true };
+    SetTimer(g_card, kCardMotionTimer, 16, CardMotionTick);
+}
+
+// Windows' acrylic behind the card (undocumented SetWindowCompositionAttribute, as Windows itself uses for
+// its flyouts). Rounded corners come from the window region, since the blur covers the whole window.
+void ApplyCardBackdrop(int w, int h, int radius) {
+    struct AccentPolicy { int state, flags; DWORD color; int animation; };
+    struct CompositionData { int attribute; void* data; SIZE_T size; };
+    using SetWca = BOOL(WINAPI*)(HWND, CompositionData*);
+    static auto set = reinterpret_cast<SetWca>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
+    if (!set || !g_card) return;
+    // 4 = acrylic blur behind, 0 = off; the tint is ABGR and must not be fully transparent.
+    AccentPolicy accent{ g_cardAcrylic ? 4 : 0, 2, g_light ? 0x60F3F3F3u : 0x60202020u, 0 };
+    CompositionData data{ 19 /* WCA_ACCENT_POLICY */, &accent, sizeof(accent) };
+    set(g_card, &data);
+    SetWindowRgn(g_card, g_cardAcrylic ? CreateRoundRectRgn(0, 0, w + 1, h + 1, 2 * radius, 2 * radius) : nullptr, TRUE);
+}
+
 void HideCard() {
     g_cardItem = -1;
-    if (g_card) ShowWindow(g_card, SW_HIDE);
+    if (!g_card || !IsWindowVisible(g_card)) return;
+    if (g_cardMotion.running && g_cardMotion.hideAtEnd) return;  // already fading out
+    if (MotionOn() && !g_cardAcrylic) AnimateCard(g_cardX, g_cardY, 0, 100, true);
+    else {
+        g_cardMotion.running = false;
+        KillTimer(g_card, kCardMotionTimer);
+        ShowWindow(g_card, SW_HIDE);
+    }
 }
 
 void ShowCard(HWND strip, int item) {
@@ -1646,9 +1780,13 @@ void ShowCard(HWND strip, int item) {
     HFONT title = MakeFont(Px(14), FW_SEMIBOLD, L"Segoe UI Variable Text", L"Segoe UI");
     HFONT big = MakeFont(Px(28), FW_SEMIBOLD, L"Segoe UI Variable Display", L"Segoe UI");
     HFONT body = MakeFont(Px(12), FW_NORMAL, L"Segoe UI Variable Text", L"Segoe UI");
+    HFONT small = MakeFont(Px(11), FW_NORMAL, L"Segoe UI Variable Text", L"Segoe UI");
+    Rgb amber = g_light ? Rgb{ 157, 93, 0 } : Rgb{ 242, 179, 61 };
 
-    const int pad = Px(16), minW = Px(240), maxW = Px(380), textMax = maxW - 2 * pad;
-    struct Line { Mask m; Rgb c; int x, y; };
+    const int pad = Px(16), minW = Px(260), maxW = Px(380), textMax = maxW - 2 * pad;
+    struct Line { Mask m; Rgb c; int x, y; bool right = false; };  // right: aligned to the card's right edge
+    RECT chip{};  // connection label in the title row (outlined), empty = none
+    int yLabelW = 0;  // width of the chart's "100%" / "0%" labels
     std::vector<Line> lines;
     Mask glyph;
     int W = minW, y = pad, barY = -1, pct = -1, barAlpha = 255, chartY = -1, chartNow = -1, axisY = 0;
@@ -1674,25 +1812,52 @@ void ShowCard(HWND strip, int item) {
         // icon + name
         glyph = RenderMask(std::wstring(1, Glyph(it.kind, it.bluetooth)), icons, false);
         int nameX = pad + glyph.w + Px(10);
-        Mask name = RenderLine(Fit(it.name, title, maxW - pad - nameX), title);
+        // The connection as a small outlined label at the right of the title row (fork).
+        Mask conn = it.connection.empty() ? Mask{} : RenderLine(Fit(it.connection, small, Px(120)), small);
+        const int chipPadX = Px(7), chipW = conn.w ? conn.w + 2 * chipPadX : 0, chipGap = conn.w ? Px(10) : 0;
+        Mask name = RenderLine(Fit(it.name, title, maxW - pad - nameX - chipW - chipGap), title);
         int rowH = std::max(glyph.h, name.h);
-        W = std::max(W, nameX + name.w + pad);
+        W = std::max(W, nameX + name.w + chipGap + chipW + pad);
         int nameY = y + (rowH - name.h) / 2;
         lines.push_back({ std::move(name), fg, nameX, nameY });
+        if (conn.w) {
+            int chipH = conn.h + Px(2);
+            chip = { 0, y + (rowH - chipH) / 2, chipW, y + (rowH - chipH) / 2 + chipH };  // x set once W is known
+            int connY = chip.top + (chipH - conn.h) / 2;
+            lines.push_back({ std::move(conn), sub, 0, connY, true });
+        }
         int glyphY = y + (rowH - glyph.h) / 2;
         y += rowH + Px(8);
         // big level, with the state next to it
         std::wstring level = !it.text.empty() ? it.text : it.percent >= 0 ? std::to_wstring(it.percent) + L"%" : L"?";
         Mask lv = RenderLine(level, big);
         int lvY = y;
-        W = std::max(W, lv.w + 2 * pad);
-        Rgb levelColor = it.low ? red : fg;
+        const bool warn = !it.low && !it.charging && !it.full && it.percent >= 0 && it.percent < 25;
+        Rgb levelColor = it.low ? red : warn ? amber : fg;
+        // Next to the level, right-aligned: the time left and when it runs out (fork). One place for it:
+        // the chart below no longer repeats it.
+        Mask left, emptyAt;
+        if (!it.charging && !it.hoursLeftText.empty()) {
+            left = RenderLine(Fit(TF(L"{time} left", { { L"time", it.hoursLeftText } }), body, Px(190)), body);
+            if (!it.emptyAtText.empty())
+                emptyAt = RenderLine(Fit(TF(L"empty around {when}", { { L"when", it.emptyAtText } }), small, Px(190)), small);
+        }
+        int sideW = std::max(left.w, emptyAt.w);
+        W = std::max(W, lv.w + (sideW ? Px(16) + sideW : 0) + 2 * pad);
+        int lvH = lv.h;
         lines.push_back({ std::move(lv), levelColor, pad, lvY });
-        y += lines.back().m.h + Px(4);
+        if (left.w) {
+            int sideH = left.h + (emptyAt.w ? emptyAt.h : 0);
+            int sy = lvY + std::max(0, lvH - sideH) - Px(2);  // bottom-aligned with the big level
+            int lh = left.h;
+            lines.push_back({ std::move(left), fg, 0, sy, true });
+            if (emptyAt.w) lines.push_back({ std::move(emptyAt), sub, 0, sy + lh, true });
+        }
+        y += lvH + Px(4);
         // level bar
         pct = it.percent;
         barAlpha = it.dim ? 150 : 255;  // asleep / last known value: same colours, a little faded
-        barColor = it.low ? red : it.charging ? charge : it.full ? green
+        barColor = it.low ? red : it.charging ? charge : it.full ? green : warn ? amber
                  : it.accent != Accent::None ? Rgb{ AccentColor(it.accent, g_light).r, AccentColor(it.accent, g_light).g, AccentColor(it.accent, g_light).b }
                  : green;
         barY = y;
@@ -1710,17 +1875,19 @@ void ShowCard(HWND strip, int item) {
         // chart: the recorded levels of the last 24 hours, then the forecast down to empty (dashed)
         forecastHours = it.percent > 0 ? it.hoursLeft : -1;
         if (g_chartOn && it.percent >= 0 && (!it.trend.empty() || forecastHours > 0)) {
-            y += Px(8);
-            Mask cap = RenderLine(T(forecastHours > 0 ? L"Last 24 hours and forecast" : L"Last 24 hours"), body);
-            lines.push_back({ std::move(cap), sub, pad, y });
-            y += lines.back().m.h + Px(6);
+            y += Px(12);  // no caption (fork): the axis labels name the time span
             chartY = y;
             chart = it.trend;
             chartNow = it.percent;
             y += Px(56) + Px(4);
             axisLeft = RenderLine(T(L"24h ago"), body);
             axisNow = RenderLine(T(L"Now"), body);
-            if (forecastHours > 0) axisEnd = RenderLine(it.hoursLeftText, body);
+            // The right end is when it runs out ("Wed 10:00"); the time left is already next to the level.
+            if (forecastHours > 0) axisEnd = RenderLine(!it.emptyAtText.empty() ? it.emptyAtText : it.hoursLeftText, body);
+            Mask top = RenderLine(L"100%", small), bottom = RenderLine(L"0%", small);
+            yLabelW = std::max(top.w, bottom.w) + Px(6);
+            lines.push_back({ std::move(top), sub, pad, chartY - top.h / 2 });
+            lines.push_back({ std::move(bottom), sub, pad + yLabelW - Px(6) - bottom.w, chartY + Px(56) - 1 - bottom.h / 2 });
             axisY = y;
             y += axisLeft.h;
         }
@@ -1736,11 +1903,13 @@ void ShowCard(HWND strip, int item) {
     DeleteObject(title);
     DeleteObject(big);
     DeleteObject(body);
+    DeleteObject(small);
 
     Canvas cv(W, H);
     int radius = Px(8);
-    FillRound(cv, 0, 0, W, H, radius, border, 255);
-    FillRound(cv, 1, 1, W - 2, H - 2, std::max(1, radius - 1), bg, 255);
+    const int bgAlpha = g_cardAcrylic ? 120 : 255;  // acrylic: the blurred desktop shows through the fill
+    FillRound(cv, 0, 0, W, H, radius, border, g_cardAcrylic ? 160 : 255);
+    FillRound(cv, 1, 1, W - 2, H - 2, std::max(1, radius - 1), bg, bgAlpha);
     if (barY >= 0) {
         int bw = W - 2 * pad, bh = Px(6);
         FillRound(cv, pad, barY, bw, bh, bh / 2, track, g_light ? 28 : 40);
@@ -1749,7 +1918,7 @@ void ShowCard(HWND strip, int item) {
     if (chartY >= 0) {
         // Time runs left to right: the last 24 hours, "now", then (when there is an estimate) the forecast down
         // to 0%. The past takes 45% of the width when a forecast is shown, so "now" never gets squeezed.
-        const int cx = pad, cw = W - 2 * pad, ch = Px(56);
+        const int cx = pad + yLabelW, cw = W - 2 * pad - yLabelW, ch = Px(56);
         const double past = 24.0 * 3600.0, maxFuture = 90.0 * 24 * 3600.0;  // the forecast side has its own width
         const double future = forecastHours > 0 ? std::min(forecastHours * 3600.0, maxFuture) : 0;
         const double pastW = future > 0 ? (cw - 1) * 0.45 : (cw - 1);
@@ -1812,7 +1981,23 @@ void ShowCard(HWND strip, int item) {
         if (future > 0 || nowX > cx + lines.back().m.w + Px(6)) lines.push_back({ std::move(axisNow), sub, nowLabelX, axisY });
         if (future > 0 && axisEnd.w > 0) lines.push_back({ std::move(axisEnd), fg, endX, axisY });
     }
-    for (const auto& l : lines) cv.Draw(l.m, l.x, l.y, l.c, 255);
+    if (chip.right > chip.left) {  // outline of the connection label
+        int cw = chip.right - chip.left, chh = chip.bottom - chip.top, cx0 = W - pad - cw;
+        Rgb line = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
+        FillRound(cv, cx0, chip.top, cw, chh, chh / 2, line, g_light ? 40 : 52);
+        // punch the outline's middle back to the card's own fill
+        for (int yy = chip.top + 1; yy < chip.bottom - 1; yy++)
+            for (int xx = cx0 + 1; xx < cx0 + cw - 1; xx++) {
+                int ddx = xx < cx0 + chh / 2 ? cx0 + chh / 2 - xx : (xx >= cx0 + cw - chh / 2 ? xx - (cx0 + cw - chh / 2 - 1) : 0);
+                int ddy = yy - (chip.top + chh / 2);
+                if (ddx * ddx + ddy * ddy <= (chh / 2 - 1) * (chh / 2 - 1)) cv.px[(size_t)yy * W + xx] = cv.px[(size_t)(chip.top - 2) * W + xx];
+            }
+    }
+    for (const auto& l : lines) {
+        int lx = l.x;
+        if (l.right) lx = W - pad - l.m.w - (chip.right > chip.left && l.y >= chip.top && l.y < chip.bottom ? Px(7) : 0);
+        cv.Draw(l.m, lx, l.y, l.c, 255);
+    }
 
     // Above the device (below it for a top taskbar, beside it for a left / right one), kept on its monitor.
     RECT ir{};
@@ -1835,7 +2020,22 @@ void ShowCard(HWND strip, int item) {
     }
     x = std::max((int)mon.left + gap, std::min(x, (int)mon.right - gap - W));
     top = std::max((int)mon.top + gap, std::min(top, (int)mon.bottom - gap - H));
+    // Where the card starts its entrance: a few pixels closer to the taskbar it comes out of.
+    int rise = Px(6), startX = x, startY = top;
+    if (vertical) startX += x > br.left ? -rise : rise;
+    else startY += top < br.top ? rise : -rise;
     g_dpiBar = nullptr;
+
+    // A card that is fading out counts as shown: it turns around and comes back from where it is.
+    const bool wasShown = IsWindowVisible(g_card) != FALSE;
+    const bool animate = MotionOn() && !g_cardAcrylic;  // acrylic blur cannot fade with the window
+    if (!wasShown) {
+        g_cardMotion.running = false;
+        KillTimer(g_card, kCardMotionTimer);
+        g_cardX = animate ? startX : x;
+        g_cardY = animate ? startY : top;
+        g_cardA = animate ? 0 : 255;
+    }
 
     HDC screen = GetDC(nullptr);
     HDC mem = CreateCompatibleDC(screen);
@@ -1846,33 +2046,91 @@ void ShowCard(HWND strip, int item) {
     memcpy(bits, cv.px.data(), (size_t)W * H * 4);
     HGDIOBJ ob = SelectObject(mem, bmp);
     SIZE sz{ W, H };
-    POINT src{ 0, 0 }, dst{ x, top };
-    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    POINT src{ 0, 0 }, dst{ g_cardX, g_cardY };
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, (BYTE)g_cardA, AC_SRC_ALPHA };
     UpdateLayeredWindow(g_card, screen, &dst, &sz, mem, &src, 0, &bf, ULW_ALPHA);
     SelectObject(mem, ob);
     DeleteObject(bmp);
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
+    if (g_cardAcrylic) ApplyCardBackdrop(W, H, radius);
     SetWindowPos(g_card, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (!animate) {
+        g_cardMotion.running = false;
+        KillTimer(g_card, kCardMotionTimer);
+        PlaceCard(x, top, 255);
+    } else if (!wasShown) {
+        AnimateCard(x, top, 255, 160, false);  // entrance
+    } else if (g_cardX != x || g_cardY != top || g_cardA != 255) {
+        AnimateCard(x, top, 255, 180, false);  // to the next device, or back from a fade-out
+    }
     g_cardItem = item;
     g_cardStrip = strip;
 }
 
-// Hover highlight for the strip under the mouse: the primary one or a mirror.
-void SetHover(HWND h, bool on) {
+// Repaints every strip for an animation frame (charging fill, hover fade, bar glide). Unlike Paint(), a
+// frame of the same size does not move the window again: the strips are only re-placed when they grew
+// or shrank.
+void RepaintFrame() {
+    SIZE before = g_size;
+    int lastW = g_lastW;
+    Paint();
+    if (g_size.cx == before.cx && g_size.cy == before.cy) g_lastW = lastW;
+    else widget::Reposition();
+    for (auto& m : g_mirrors) {
+        if (!IsWindowVisible(m.wnd)) continue;
+        SIZE ms = m.size;
+        int lastLeft = m.lastLeft;
+        PaintMirror(m);
+        if (m.size.cx == ms.cx && m.size.cy == ms.cy) m.lastLeft = lastLeft;
+        else PositionMirror(m);
+    }
+}
+
+constexpr UINT_PTR kMotionTimer = 5;  // hover fade and bar glide frames, ~60 per second while they run
+
+bool MotionRunning() {
+    const ULONGLONG now = GetTickCount64();
+    bool fading = g_hoverFade.item >= 0 && now - g_hoverFade.start < kHoverFadeMs;
+    for (const auto& m : g_mirrors) fading |= m.fade.item >= 0 && now - m.fade.start < kHoverFadeMs;
+    return fading || BarsGliding();
+}
+
+void StartMotion() {
+    if (g_wnd && MotionOn()) SetTimer(g_wnd, kMotionTimer, 16, nullptr);
+}
+
+// Hover plate for the strip under the mouse, the primary one or a mirror: `item` is the device under the
+// mouse (-1 = none). The plate of the device the mouse left fades out.
+void SetHover(HWND h, bool on, int item) {
+    bool* hover = nullptr;
+    int* at = nullptr;
+    HoverFade* fade = nullptr;
+    Mirror* mirror = nullptr;
     if (h == g_wnd) {
-        if (g_hover == on) return;
-        g_hover = on;
+        hover = &g_hover;
+        at = &g_hoverAt;
+        fade = &g_hoverFade;
+    } else {
+        for (auto& m : g_mirrors)
+            if (m.wnd == h) { mirror = &m; hover = &m.hover; at = &m.hoverItem; fade = &m.fade; }
+        if (!mirror) return;
+    }
+    if (!on) item = -1;
+    if (*hover == on && *at == item) return;
+    if (*hover && *at >= 0 && *at != item && MotionOn()) {
+        *fade = { *at, GetTickCount64() };
+        StartMotion();
+    }
+    *hover = on;
+    *at = item;
+    if (mirror) {
+        PaintMirror(*mirror);
+        PositionMirror(*mirror);
+    } else {
         Paint();
         widget::Reposition();
-        return;
     }
-    for (auto& m : g_mirrors)
-        if (m.wnd == h && m.hover != on) {
-            m.hover = on;
-            PaintMirror(m);
-            PositionMirror(m);
-        }
 }
 
 // Only the main strip, next to the clock on a horizontal left-to-right taskbar: the other placements
@@ -1946,10 +2204,10 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             TRACKMOUSEEVENT t{ sizeof(t), TME_LEAVE, h, 0 };
             TrackMouseEvent(&t);
-            SetHover(h, true);
-            if (!g_cardOn) return 0;  // card turned off: the plain tooltip shows the summary instead
             POINT p{ (short)LOWORD(lp), (short)HIWORD(lp) };
             int k = ItemAt(h, p);
+            SetHover(h, true, k);
+            if (!g_cardOn) return 0;  // card turned off: the plain tooltip shows the summary instead
             if (k != g_hoverItem || h != g_cardStrip) {
                 g_hoverItem = k;
                 if (g_cardItem != -1 && k != -1) {
@@ -1967,14 +2225,23 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 KillTimer(h, kCardTimer);
                 if (g_hoverItem != -1) ShowCard(h, g_hoverItem);
             } else if (wp == kChargeTimer) {
-                PaintAll();
-                widget::Reposition();
+                // Nothing to animate while the strip is hidden (fullscreen game, other monitor chosen).
+                if (IsWindowVisible(g_wnd) || std::any_of(g_mirrors.begin(), g_mirrors.end(),
+                                                          [](const Mirror& m) { return IsWindowVisible(m.wnd) != FALSE; }))
+                    RepaintFrame();
+            } else if (wp == kPillRemeasureTimer) {
+                KillTimer(h, kPillRemeasureTimer);
+                if (g_wbWake) SetEvent(g_wbWake);
+            } else if (wp == kMotionTimer) {
+                bool running = MotionRunning();
+                RepaintFrame();
+                if (!running) KillTimer(h, kMotionTimer);
             } else if (wp == kFinderTimer) {
                 widget::Reposition();
             }
             return 0;
         case WM_MOUSELEAVE:
-            SetHover(h, false);
+            SetHover(h, false, -1);
             KillTimer(h, kCardTimer);
             g_hoverItem = -1;
             HideCard();
@@ -2122,6 +2389,7 @@ void Destroy() {
     g_primaryHidden = false;  // the next Create() decides again
     if (g_wbWake) WatchWidgetsButton(nullptr);
     if (g_card) { DestroyWindow(g_card); g_card = nullptr; }
+    g_cardMotion.running = false;
     if (g_tip) { DestroyWindow(g_tip); g_tip = nullptr; }
     g_cardItem = g_hoverItem = -1;
     g_cardStrip = nullptr;
@@ -2130,6 +2398,8 @@ void Destroy() {
     if (g_wnd) { DestroyWindow(g_wnd); g_wnd = nullptr; }
     g_taskbar = nullptr;
     g_hover = false;
+    g_hoverAt = -1;
+    g_hoverFade = {};
     g_painted = false;
     g_size = {};
     g_paintedBarClient = {};
@@ -2142,7 +2412,8 @@ void UpdateChargeTimer() {
     if (!g_wnd) return;
     bool any = false;
     for (const auto& it : g_items) any |= it.charging && !it.full;
-    if (g_animateCharging && any) SetTimer(g_wnd, kChargeTimer, 100, nullptr);
+    // With Windows' animation effects off the bolt alone shows charging; no repaint every 100 ms.
+    if (g_animateCharging && any && MotionOn()) SetTimer(g_wnd, kChargeTimer, 100, nullptr);
     else KillTimer(g_wnd, kChargeTimer);
 }
 
@@ -2163,6 +2434,7 @@ void SetItems(const std::vector<WidgetItem>& items, const std::wstring& tooltip)
     PaintAll();
     Reposition();
     UpdateChargeTimer();
+    if (BarsGliding()) StartMotion();
     if (g_cardItem != -1 && g_cardStrip && IsWindow(g_cardStrip)) {  // keep an open card up to date
         if (g_cardItem == kCardMessage ? g_items.empty() : g_cardItem < (int)g_items.size()) ShowCard(g_cardStrip, g_cardItem);
         else HideCard();
@@ -2256,6 +2528,11 @@ void ApplyLeftSpot() {
     ReleaseSRWLockExclusive(&g_wbLock);
     if (on && g_wbWake) SetEvent(g_wbWake);  // measure the taskbar now, not in 5 s
     if (g_wnd) Reposition();
+}
+
+void SetCardAcrylic(bool on) {
+    g_cardAcrylic = on;
+    if (g_card && !on) ApplyCardBackdrop(0, 0, 0);
 }
 
 void SetWindhawkPill(bool on) {

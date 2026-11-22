@@ -63,7 +63,7 @@ constexpr UINT ALERT_ICON_ID = 2;
 enum MenuId : UINT {
     ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT, ID_REPORT,
     ID_BRAND_COLORS, ID_STACKED, ID_SHOW_DISCONNECTED, ID_RECORD_HISTORY, ID_DIM_SLEEPING,
-    ID_TRAY_WHEN_EMPTY, ID_MAKE_ROOM, ID_FAR_LEFT, ID_PERCENT_SIGN, ID_RING_STYLE, ID_BEFORE_APPS, ID_CONNECTION_ICONS, ID_KEEP_MOUSE_LAST_KNOWN, ID_SHORT_RUNTIME_ALERT, ID_HOVER_CARD, ID_HOVER_CHART, ID_TRAY_DEVICE_ICONS, ID_ANIMATE_CHARGING, ID_TRACK_SINCE, ID_TRACK_AWAKE, ID_TRACK_EMPTY, ID_RUNTIME_WIDGET, ID_MODE_MYFINDER, ID_WINDHAWK_PILL,
+    ID_TRAY_WHEN_EMPTY, ID_MAKE_ROOM, ID_FAR_LEFT, ID_PERCENT_SIGN, ID_RING_STYLE, ID_BEFORE_APPS, ID_CONNECTION_ICONS, ID_KEEP_MOUSE_LAST_KNOWN, ID_SHORT_RUNTIME_ALERT, ID_HOVER_CARD, ID_HOVER_CHART, ID_TRAY_DEVICE_ICONS, ID_ANIMATE_CHARGING, ID_TRACK_SINCE, ID_TRACK_AWAKE, ID_TRACK_EMPTY, ID_RUNTIME_WIDGET, ID_MODE_MYFINDER, ID_WINDHAWK_PILL, ID_CARD_ACRYLIC,
     ID_PLACE_AUTO, ID_PLACE_TOP, ID_PLACE_TRAY, ID_PLACE_BOTTOM,  // "Position on a vertical taskbar"
     ID_POSITION_FIRST = 700,  // "Position on the taskbar": ID_POSITION_FIRST + 0..5, then the custom value
     ID_POLL_FIRST = 500,  // "Check battery every": ID_POLL_FIRST + 0..7
@@ -108,6 +108,7 @@ bool g_runtimeWidget = false;  // optionally show estimated remaining hours inst
 std::wstring g_widgetMonitor = L"all";  // which taskbars show the widget: "all", "main" or one monitor id
 bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
 bool g_windhawkPill = false;  // sit inside a Windhawk Taskbar Styler tray "pill" (fork option)
+bool g_cardAcrylic = false;  // hover card on a blurred, see-through Windows backdrop (fork option)
 bool g_stacked = false;      // icon above the percentage (menu option)
 bool g_showPercentSign = true;  // include '%' in taskbar battery labels (menu option)
 bool g_ringStyle = false;  // device icon inside a battery ring (menu option, PR #110)
@@ -903,6 +904,30 @@ std::vector<TrayEntry*> OrderedEntries(bool shownOnly) {
 
 void UpdateStatusSnapshot();
 
+
+// When a battery with `hours` left runs out, short and in the user's Windows format: "10:00" today,
+// "Wed 10:00" within a week, the date after that. The card's chart labels its right end with it.
+std::wstring EmptyAtText(double hours) {
+    if (hours <= 0 || hours > 24 * 365) return {};
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER t{ { ft.dwLowDateTime, ft.dwHighDateTime } };
+    SYSTEMTIME nowUtc, nowLocal, atUtc, atLocal;
+    FileTimeToSystemTime(&ft, &nowUtc);
+    t.QuadPart += (ULONGLONG)(hours * 3600.0) * 10000000ULL;
+    FILETIME at{ t.LowPart, t.HighPart };
+    FileTimeToSystemTime(&at, &atUtc);
+    if (!SystemTimeToTzSpecificLocalTime(nullptr, &nowUtc, &nowLocal) || !SystemTimeToTzSpecificLocalTime(nullptr, &atUtc, &atLocal))
+        return {};
+    wchar_t time[64] = {}, day[64] = {};
+    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &atLocal, nullptr, time, ARRAYSIZE(time));
+    bool today = atLocal.wYear == nowLocal.wYear && atLocal.wMonth == nowLocal.wMonth && atLocal.wDay == nowLocal.wDay;
+    if (today) return time;
+    if (hours < 24 * 6) GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &atLocal, L"ddd", day, ARRAYSIZE(day), nullptr);
+    else GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &atLocal, nullptr, day, ARRAYSIZE(day), nullptr);
+    return hours < 24 * 6 ? std::wstring(day) + L" " + time : std::wstring(day);
+}
+
 void UpdateWidget() {
     if (!g_useWidget || !widget::Alive()) return;  // not alive while the strip is swapped for the tray
     std::vector<TrayEntry*> list = OrderedEntries(true);
@@ -953,11 +978,13 @@ void UpdateWidget() {
             if (it.hoursLeft < 0) {  // not enough for the estimate yet: a rough one, marked as approximate
                 it.hoursLeft = battery_history::RoughHoursRemaining(e->st.key);
                 if (it.hoursLeft >= 0)
-                    it.hoursLeftText = TF(L"{time} (approx.)", { { L"time", battery_history::FormatHours(it.hoursLeft) } });
+                    it.hoursLeftText = battery_history::FormatHours(it.hoursLeft);  // the "~" marks it as rough
             }
-            if (!it.hoursLeftText.empty()) it.info.push_back(std::wstring(T(L"Estimated time to empty")) + L": " + it.hoursLeftText);
+            // The card shows the time left next to the level and the moment it runs out under the chart
+            // (fork): no separate "Estimated time to empty" line, and the connection sits in the title row.
+            if (it.hoursLeft > 0) it.emptyAtText = EmptyAtText(it.hoursLeft);
         }
-        if (!e->st.via.empty() && e->st.via != L"demo") it.info.push_back(T(e->st.via));
+        if (!e->st.via.empty() && e->st.via != L"demo") it.connection = T(e->st.via);
         if (g_hoverCard && g_hoverChart && g_recordHistory)
             for (const auto& pt : battery_history::Recent(e->st.key, 24)) it.trend.push_back({ pt.secondsAgo, pt.percent });
         items.push_back(it);
@@ -1458,8 +1485,18 @@ void ShowMenu() {
         std::wstring title = TF(L"No battery info ({count})", { { L"count", std::to_wstring(g_unsupported.size()) } });
         AppendMenuW(m, MF_POPUP, (UINT_PTR)un, title.c_str());
     }
-    if (!all.empty()) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g_recordHistory ? MF_CHECKED : 0), ID_RECORD_HISTORY, T(L"Record battery history"));
+    if (!all.empty() || !g_unsupported.empty()) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, ID_REFRESH, T(L"Refresh now"));
+    icons.SetLast(m, 0xE72C);  // Refresh
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    // The settings are grouped by topic (fork): notifications, battery history, display, general.
+    // A greyed line names each group inside a long submenu. Command ids are unchanged.
+    auto heading = [](HMENU menu, const wchar_t* text) {
+        if (GetMenuItemCount(menu) > 0) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, text);
+    };
+
+    HMENU notify = CreatePopupMenu();
     {
         HMENU sub = CreatePopupMenu();
         AppendMenuW(sub, MF_STRING, ID_LIMIT_OFF, T(L"Off"));
@@ -1470,21 +1507,26 @@ void ShowMenu() {
             if (g_chargeLimit == alerts::kChargeLimits[i]) checked = ID_LIMIT_FIRST + i;
         }
         CheckMenuRadioItem(sub, ID_LIMIT_OFF, ID_LIMIT_FIRST + alerts::kChargeLimitCount - 1, checked, MF_BYCOMMAND);
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, T(L"Notify when charged to (saves the battery)"));
+        AppendMenuW(notify, MF_POPUP, (UINT_PTR)sub, T(L"Notify when charged to (saves the battery)"));
     }
-    AppendMenuW(m, MF_STRING | (g_shortRuntimeAlert ? MF_CHECKED : 0) | (g_recordHistory ? 0 : MF_GRAYED), ID_SHORT_RUNTIME_ALERT,
+    AppendMenuW(notify, MF_STRING | (g_shortRuntimeAlert ? MF_CHECKED : 0) | (g_recordHistory ? 0 : MF_GRAYED), ID_SHORT_RUNTIME_ALERT,
                 T(L"Warn when a battery won't last the day"));
-    {
-        HMENU sub = CreatePopupMenu();
-        AppendMenuW(sub, MF_STRING | (g_trackSince ? MF_CHECKED : 0), ID_TRACK_SINCE, T(L"Time since charge"));
-        AppendMenuW(sub, MF_STRING | (g_trackAwake ? MF_CHECKED : 0), ID_TRACK_AWAKE, T(L"Awake time (rough)"));
-        UINT emptyFlags = MF_STRING | (g_trackEmpty ? MF_CHECKED : 0) | (g_recordHistory ? 0 : MF_GRAYED);
-        AppendMenuW(sub, emptyFlags, ID_TRACK_EMPTY, T(L"Estimated time to empty"));  // needs the recorded history
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, T(L"Battery tracking"));
-    }
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)notify, T(L"Notifications"));
+    icons.SetLast(m, 0xEA8F);  // Ringer
+
+    HMENU history = CreatePopupMenu();
+    AppendMenuW(history, MF_STRING | (g_recordHistory ? MF_CHECKED : 0), ID_RECORD_HISTORY, T(L"Record battery history"));
+    heading(history, T(L"Battery tracking"));
+    AppendMenuW(history, MF_STRING | (g_trackSince ? MF_CHECKED : 0), ID_TRACK_SINCE, T(L"Time since charge"));
+    AppendMenuW(history, MF_STRING | (g_trackAwake ? MF_CHECKED : 0), ID_TRACK_AWAKE, T(L"Awake time (rough)"));
+    AppendMenuW(history, MF_STRING | (g_trackEmpty ? MF_CHECKED : 0) | (g_recordHistory ? 0 : MF_GRAYED), ID_TRACK_EMPTY,
+                T(L"Estimated time to empty"));  // needs the recorded history
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)history, T(L"Battery history"));
+    icons.SetLast(m, 0xE81C);  // History
+
     // Display settings (PR #3292): how and where the devices are shown, in one submenu.
     HMENU display = CreatePopupMenu();
+    heading(display, T(L"Placement"));
     AppendMenuW(display, MF_STRING | (g_wantWidget && !g_myFinder ? MF_CHECKED : 0), ID_MODE_WIDGET,
                 T(L"Show on the taskbar (icon + percentage)"));
     AppendMenuW(display, MF_STRING | (!g_wantWidget ? MF_CHECKED : 0), ID_MODE_TRAY, T(L"Show as tray icons"));
@@ -1492,26 +1534,8 @@ void ShowMenu() {
     if (g_myFinder || FindWindowW(L"MyFinderApp", nullptr))
         AppendMenuW(display, MF_STRING | (g_wantWidget && g_myFinder ? MF_CHECKED : 0), ID_MODE_MYFINDER,
                     T(L"Show on MyDockFinder (experimental)"));
-    AppendMenuW(display, MF_STRING | (g_trayDeviceIcons ? MF_CHECKED : 0) | (g_wantWidget ? MF_GRAYED : 0), ID_TRAY_DEVICE_ICONS,
-                T(L"Tray icons show the device type"));
-    AppendMenuW(display, MF_SEPARATOR, 0, nullptr);
-    UINT bgFlags = MF_STRING | (g_widgetBackground ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED);
-    AppendMenuW(display, bgFlags, ID_WIDGET_BACKGROUND, T(L"Background behind taskbar text (for transparent taskbars)"));
     AppendMenuW(display, MF_STRING | (g_windhawkPill ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_WINDHAWK_PILL,
                 T(L"Inside the Windhawk tray pill"));
-    AppendMenuW(display, MF_STRING | (g_stacked ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_STACKED, T(L"Icons above percentages (narrower)"));
-    AppendMenuW(display, MF_STRING | (g_showPercentSign ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_PERCENT_SIGN,
-                T(L"Show percent sign (%)"));
-    AppendMenuW(display, MF_STRING | (g_ringStyle ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_RING_STYLE,
-                T(L"Ring style (icon inside a battery ring)"));
-    AppendMenuW(display, MF_STRING | (g_animateCharging ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_ANIMATE_CHARGING,
-                T(L"Animate charging devices"));
-    AppendMenuW(display, MF_STRING | (g_connectionIcons ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_CONNECTION_ICONS,
-                T(L"Mark devices on a 2.4 GHz receiver"));
-    AppendMenuW(display, MF_STRING | (g_hoverCard ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_HOVER_CARD,
-                T(L"Show a card when the mouse rests on a device"));
-    AppendMenuW(display, MF_STRING | (g_hoverChart ? MF_CHECKED : 0) | (g_wantWidget && g_hoverCard && g_recordHistory ? 0 : MF_GRAYED),
-                ID_HOVER_CHART, T(L"Show the last 24 hours in the card"));
     {
         HMENU sub = CreatePopupMenu();
         UINT f = MF_STRING | (g_wantWidget ? 0 : MF_GRAYED);
@@ -1553,8 +1577,6 @@ void ShowMenu() {
     AppendMenuW(display, MF_STRING | (g_farLeft ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_FAR_LEFT, T(L"At the left end of the taskbar"));
     AppendMenuW(display, MF_STRING | (g_beforeApps ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_BEFORE_APPS,
                 T(L"Just before the taskbar apps"));
-    AppendMenuW(display, MF_STRING | (g_runtimeWidget ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_RUNTIME_WIDGET,
-                T(L"Show estimated time instead of % (when available)"));
     // With more than one monitor: choose which taskbars show the widget (all, main only, or one monitor).
     auto monitors = widget::OtherMonitors();
     if (monitors.size() > 31) monitors.resize(31);
@@ -1580,8 +1602,31 @@ void ShowMenu() {
         AppendMenuW(display, MF_POPUP | (g_wantWidget ? 0 : MF_GRAYED), (UINT_PTR)sub, T(L"Show the widget on"));
         icons.SetLast(display, 0xE7F4);  // TVMonitor
     }
+    heading(display, T(L"Appearance"));
+    UINT bgFlags = MF_STRING | (g_widgetBackground ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED);
+    AppendMenuW(display, bgFlags, ID_WIDGET_BACKGROUND, T(L"Background behind taskbar text (for transparent taskbars)"));
+    AppendMenuW(display, MF_STRING | (g_stacked ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_STACKED, T(L"Icons above percentages (narrower)"));
+    AppendMenuW(display, MF_STRING | (g_showPercentSign ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_PERCENT_SIGN,
+                T(L"Show percent sign (%)"));
+    AppendMenuW(display, MF_STRING | (g_runtimeWidget ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_RUNTIME_WIDGET,
+                T(L"Show estimated time instead of % (when available)"));
+    AppendMenuW(display, MF_STRING | (g_ringStyle ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_RING_STYLE,
+                T(L"Ring style (icon inside a battery ring)"));
+    AppendMenuW(display, MF_STRING | (g_connectionIcons ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_CONNECTION_ICONS,
+                T(L"Mark devices on a 2.4 GHz receiver"));
+    AppendMenuW(display, MF_STRING | (g_animateCharging ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_ANIMATE_CHARGING,
+                T(L"Animate charging devices"));
     AppendMenuW(display, MF_STRING | (g_brandColors ? MF_CHECKED : 0), ID_BRAND_COLORS, T(L"Brand colors (Razer green, Logitech blue, ...)"));
-    AppendMenuW(display, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(display, MF_STRING | (g_trayDeviceIcons ? MF_CHECKED : 0) | (g_wantWidget ? MF_GRAYED : 0), ID_TRAY_DEVICE_ICONS,
+                T(L"Tray icons show the device type"));
+    heading(display, T(L"Card"));
+    AppendMenuW(display, MF_STRING | (g_hoverCard ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_HOVER_CARD,
+                T(L"Show a card when the mouse rests on a device"));
+    AppendMenuW(display, MF_STRING | (g_hoverChart ? MF_CHECKED : 0) | (g_wantWidget && g_hoverCard && g_recordHistory ? 0 : MF_GRAYED),
+                ID_HOVER_CHART, T(L"Show the last 24 hours in the card"));
+    AppendMenuW(display, MF_STRING | (g_cardAcrylic ? MF_CHECKED : 0) | (g_wantWidget && g_hoverCard ? 0 : MF_GRAYED),
+                ID_CARD_ACRYLIC, T(L"See-through card background (acrylic)"));
+    heading(display, T(L"Devices"));
     AppendMenuW(display, MF_STRING | (g_hideLastKnown ? MF_CHECKED : 0), ID_HIDE_LAST_KNOWN, T(L"Hide last known / asleep devices"));
     AppendMenuW(display, MF_STRING | (g_keepMouseLastKnown ? MF_CHECKED : 0) | (g_hideLastKnown ? 0 : MF_GRAYED),
                 ID_KEEP_MOUSE_LAST_KNOWN, T(L"Keep last known battery for mice"));
@@ -1590,8 +1635,9 @@ void ShowMenu() {
     AppendMenuW(display, MF_STRING | (g_showDisconnectedDevices ? MF_CHECKED : 0), ID_SHOW_DISCONNECTED, T(L"Show disconnected devices"));
     AppendMenuW(display, MF_STRING | (g_dimSleeping ? MF_CHECKED : 0), ID_DIM_SLEEPING, T(L"Dim sleeping devices"));
     AppendMenuW(m, MF_POPUP, (UINT_PTR)display, T(L"Display settings"));
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    icons.SetLast(m, 0xE890);  // View
+
+    HMENU settings = CreatePopupMenu();
     // Language: automatic, every built-in or user-added language (in its own name), and a way to add one.
     i18n::Init();  // picks up language files added since the last time
     auto languages = i18n::Available();
@@ -1615,8 +1661,8 @@ void ShowMenu() {
         CheckMenuRadioItem(sub, ID_LANG_AUTO, ID_LANG_FIRST + 63, checked, MF_BYCOMMAND);
         AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(sub, MF_STRING, ID_LANG_ADD, T(L"Add your own language..."));
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, T(L"Language"));
-        icons.SetLast(m, 0xE774);  // Globe
+        AppendMenuW(settings, MF_POPUP, (UINT_PTR)sub, T(L"Language"));
+        icons.SetLast(settings, 0xE774);  // Globe
     }
     {
         HMENU sub = CreatePopupMenu();
@@ -1630,25 +1676,31 @@ void ShowMenu() {
             if (s * 1000 == g_pollIntervalMs) checked = ID_POLL_FIRST + i;
         }
         if (checked) CheckMenuRadioItem(sub, ID_POLL_FIRST, ID_POLL_FIRST + count - 1, checked, MF_BYCOMMAND);
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, T(L"Check battery every"));
-        icons.SetLast(m, 0xE916);  // Stopwatch
+        AppendMenuW(settings, MF_POPUP, (UINT_PTR)sub, T(L"Check battery every"));
+        icons.SetLast(settings, 0xE916);  // Stopwatch
     }
-    AppendMenuW(m, MF_STRING, ID_REFRESH, T(L"Refresh now"));
-    AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, T(L"Start with Windows"));
-    AppendMenuW(m, MF_STRING, ID_REPORT, T(L"Request support for a device..."));
-    AppendMenuW(m, MF_STRING, ID_SUPPORT, T(L"Support the project..."));
+    AppendMenuW(settings, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, T(L"Start with Windows"));
+    // Release updates only exist for official builds; a fork build hides both entries instead of greying them.
+    if (updates::Supported()) {
+        AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(settings, MF_STRING | (updates::Busy() ? MF_GRAYED : 0), ID_UPDATE, updates::MenuLabel().c_str());
+        icons.SetLast(settings, 0xE777);  // UpdateRestore
+        AppendMenuW(settings, MF_STRING | (updates::AutomaticEnabled() ? MF_CHECKED : 0), ID_AUTO_UPDATE,
+                    T(L"Automatically check for updates"));
+    }
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)settings, T(L"Settings"));
+    icons.SetLast(m, 0xE713);  // Settings
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (updates::Busy() ? MF_GRAYED : 0), ID_UPDATE, updates::MenuLabel().c_str());
-    UINT updateFlags = MF_STRING | (updates::AutomaticEnabled() ? MF_CHECKED : 0) |
-                       (updates::Supported() ? 0 : MF_GRAYED);
-    AppendMenuW(m, updateFlags, ID_AUTO_UPDATE, T(L"Automatically check for updates"));
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+
+    HMENU help = CreatePopupMenu();
+    AppendMenuW(help, MF_STRING, ID_REPORT, T(L"Request support for a device..."));
+    icons.SetLast(help, 0xE897);  // Help
+    AppendMenuW(help, MF_STRING, ID_SUPPORT, T(L"Support the project..."));
+    icons.SetLast(help, 0xEB51);  // Heart
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)help, T(L"Help and support"));
+    icons.SetLast(m, 0xE897);  // Help
     AppendMenuW(m, MF_STRING, ID_EXIT, T(L"Exit"));
-    icons.Set(m, ID_REFRESH, false, 0xE72C);         // Refresh
-    icons.Set(m, ID_REPORT, false, 0xE897);          // Help
-    icons.Set(m, ID_SUPPORT, false, 0xEB51);         // Heart
-    icons.Set(m, ID_UPDATE, false, 0xE777);          // UpdateRestore
-    icons.Set(m, ID_EXIT, false, 0xE711);            // Cancel
+    icons.SetLast(m, 0xE711);  // Cancel
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(g_hwnd);
@@ -1703,6 +1755,11 @@ void ShowMenu() {
         case ID_RUNTIME_WIDGET: g_runtimeWidget = !g_runtimeWidget; SaveRuntimeWidget(g_runtimeWidget); UpdateWidget(); break;
         case ID_WIDGET_BACKGROUND: SetWidgetBackground(!g_widgetBackground); break;
         case ID_WINDHAWK_PILL: SetWindhawkPill(!g_windhawkPill); break;
+        case ID_CARD_ACRYLIC:
+            g_cardAcrylic = !g_cardAcrylic;
+            SaveBoolSetting(L"CardAcrylic", g_cardAcrylic);
+            widget::SetCardAcrylic(g_cardAcrylic);
+            break;
         case ID_MONITOR_ALL: SetWidgetMonitor(L"all"); break;
         case ID_LANG_AUTO: SetLanguage(L""); break;
         case ID_LANG_ADD: i18n::OpenUserFolder(); break;
@@ -2289,6 +2346,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     widget::SetBackground(g_widgetBackground);  // remembered by the widget across re-creation
     g_windhawkPill = LoadBoolSetting(L"WindhawkPill", false);
     widget::SetWindhawkPill(g_windhawkPill);
+    g_cardAcrylic = LoadBoolSetting(L"CardAcrylic", false);
+    widget::SetCardAcrylic(g_cardAcrylic);
     i18n::Init();
     g_widgetMonitor = LoadWidgetMonitor();
     widget::SetMonitorChoice(g_widgetMonitor);

@@ -2,7 +2,7 @@
 // @id              batteryhub-pill-room
 // @name            BatteryHub pill room
 // @description     Widens a Taskbar Styler tray "pill" by exactly the width of the BatteryHub strip
-// @version         1.0.0
+// @version         1.1.0
 // @author          BatteryHub Windhawk modification
 // @include         explorer.exe
 // @architecture    x86-64
@@ -44,12 +44,18 @@ Only the main taskbar is changed, the one BatteryHub sits inside.
   $description: >-
     Pixels added to the room BatteryHub asks for (negative values take some
     away), to fine-tune the spacing in the pill
+- animationMs: 150
+  $name: Animation duration
+  $description: >-
+    How long the pill takes to grow or shrink, in milliseconds. 0 changes it
+    at once. Off as well when Windows' animation effects are turned off.
 */
 // ==/WindhawkModSettings==
 
 #include <windhawk_utils.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <functional>
 #include <list>
@@ -70,6 +76,7 @@ constexpr WCHAR kRoomValue[] = L"PillRoom";
 
 std::atomic<bool> g_unloading;
 std::atomic<int> g_extraRoom;
+std::atomic<int> g_animationMs;
 std::atomic<int> g_room;  // what BatteryHub asks for, in 96-DPI pixels
 
 HANDLE g_stopEvent;
@@ -217,6 +224,10 @@ struct PillTarget {
     Thickness basePadding{};  // the padding without our room (the theme's)
     int64_t callbackToken = 0;
     bool settingPadding = false;
+    // The room shown now, and the glide to a new room (frames on CompositionTarget::Rendering).
+    double shownRoom = 0, fromRoom = 0, toRoom = 0;
+    ULONGLONG glideStart = 0;
+    winrt::event_token renderingToken{};
 };
 [[clang::no_destroy]] std::optional<PillTarget> g_target;
 
@@ -227,12 +238,63 @@ struct TrayAddedWait {
 [[clang::no_destroy]] std::optional<std::list<TrayAddedWait>> g_trayAddedWaits{
     std::in_place};
 
-void SetPadding(PillTarget& target, FrameworkElement element, int room) {
+void SetPadding(PillTarget& target, FrameworkElement element, double room) {
+    target.shownRoom = room;
     Thickness padding = target.basePadding;
-    padding.Left = std::max(0.0, padding.Left + room);
+    padding.Left = std::max(0.0, padding.Left + std::round(room));
     target.settingPadding = true;
     element.SetValue(target.paddingProperty, winrt::box_value(padding));
     target.settingPadding = false;
+}
+
+bool AnimationsOn() {
+    BOOL on = TRUE;
+    return g_animationMs > 0 &&
+           (!SystemParametersInfo(SPI_GETCLIENTAREAANIMATION, 0, &on, 0) || on);
+}
+
+void StopGlide(PillTarget& target) {
+    if (target.renderingToken.value) {
+        Media::CompositionTarget::Rendering(target.renderingToken);
+        target.renderingToken = {};
+    }
+}
+
+// Grows or shrinks the pill to `room` over the animation duration, one step per rendered frame.
+void GlideTo(PillTarget& target, FrameworkElement element, int room) {
+    if (!AnimationsOn() || std::abs(room - target.shownRoom) < 1) {
+        StopGlide(target);
+        SetPadding(target, element, room);
+        return;
+    }
+    target.fromRoom = target.shownRoom;
+    target.toRoom = room;
+    target.glideStart = GetTickCount64();
+    if (target.renderingToken.value) {
+        return;  // already gliding: it continues towards the new room
+    }
+    target.renderingToken = Media::CompositionTarget::Rendering(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           winrt::Windows::Foundation::IInspectable const&) {
+            if (!g_target) {
+                return;
+            }
+            auto element = g_target->element.get();
+            if (!element || g_unloading) {
+                StopGlide(*g_target);
+                return;
+            }
+            double t = std::min(
+                1.0, (GetTickCount64() - g_target->glideStart) /
+                         (double)std::max(1, g_animationMs.load()));
+            double e = 1 - (1 - t) * (1 - t) * (1 - t);  // ease-out
+            SetPadding(*g_target, element,
+                       g_target->fromRoom +
+                           (g_target->toRoom - g_target->fromRoom) * e);
+            if (t >= 1) {
+                StopGlide(*g_target);
+            }
+        });
 }
 
 void ReleaseTarget(bool restore) {
@@ -240,6 +302,7 @@ void ReleaseTarget(bool restore) {
         return;
     }
 
+    StopGlide(*g_target);
     if (auto element = g_target->element.get()) {
         element.UnregisterPropertyChangedCallback(g_target->paddingProperty,
                                                   g_target->callbackToken);
@@ -297,11 +360,12 @@ bool ApplyRoom(XamlRoot xamlRoot) {
                 }
                 g_target->basePadding =
                     winrt::unbox_value<Thickness>(element.GetValue(dp));
+                StopGlide(*g_target);
                 SetPadding(*g_target, element, CurrentRoom());
             });
     }
 
-    SetPadding(*g_target, pill, CurrentRoom());
+    GlideTo(*g_target, pill, CurrentRoom());
     return true;
 }
 
@@ -597,6 +661,7 @@ bool HookTaskbarDllSymbols() {
 
 void LoadSettings() {
     g_extraRoom = std::clamp(Wh_GetIntSetting(L"extraRoom"), -200, 200);
+    g_animationMs = std::clamp(Wh_GetIntSetting(L"animationMs"), 0, 1000);
 }
 
 BOOL Wh_ModInit() {

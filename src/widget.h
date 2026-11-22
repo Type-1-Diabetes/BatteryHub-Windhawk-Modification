@@ -28,6 +28,8 @@ struct WidgetItem {
     std::vector<std::pair<long long, int>> trend;
     double hoursLeft = -1;      // estimated time to empty (the chart's dashed forecast), -1 = none
     std::wstring hoursLeftText; // the same, formatted ("~3 d 4 h")
+    std::wstring emptyAtText;   // when it runs out, short ("Wed 10 AM"); the chart's right-hand label
+    std::wstring connection;    // "2.4 GHz receiver", "Bluetooth" ...: a small label in the card's title row
 };
 
 namespace widget {
@@ -49,6 +51,8 @@ void SetLightTheme(bool light);
 void SetBackground(bool on);
 // Inside a Windhawk Taskbar Styler "pill": left of the tray's first button instead of left of the tray (kept across Create/Destroy).
 void SetWindhawkPill(bool on);
+// Hover card on a blurred, see-through Windows backdrop instead of a solid one (kept across Create/Destroy).
+void SetCardAcrylic(bool on);
 // Icon above the percentage instead of beside it, when the taskbar is tall enough (kept across Create/Destroy).
 void SetStacked(bool on);
 // Include '%' after numeric battery levels (kept across Create/Destroy).
