@@ -1832,7 +1832,7 @@ void ShowMenu() {
                     case DEV_HISTORY: {
                         auto it = g_entries.find(key);
                         if (it != g_entries.end())
-                            battery_history::Show(g_hwnd, key, DisplayName(it->second));
+                            battery_history::Show(g_hwnd, key, DisplayName(it->second), (int)AccentFor(it->second.st));
                         break;
                     }
                     default: {
@@ -2022,7 +2022,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (lp == 1 && item >= 0 && item < (int)g_widgetKeys.size()) {
                 auto it = g_entries.find(g_widgetKeys[item]);
                 if (it != g_entries.end()) {
-                    battery_history::Show(g_hwnd, it->first, DisplayName(it->second));
+                    battery_history::Show(g_hwnd, it->first, DisplayName(it->second), (int)AccentFor(it->second.st));
                     return 0;
                 }
             }

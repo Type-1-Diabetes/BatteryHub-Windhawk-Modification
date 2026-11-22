@@ -4,6 +4,7 @@
 #include "runtime_estimate.h"
 #include "i18n.h"
 #include "memory_trim.h"
+#include "brands.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -124,20 +125,34 @@ std::vector<Sample> Visible(int64_t now) {
     return points;
 }
 
-// Battery history viewer: DPI-aware, dark, compact metrics and conservative discharge ETA.
-// Follows the Windows app theme (AppsUseLightTheme), like the rest of the app.
+// Battery history viewer: DPI-aware, compact metrics and conservative discharge ETA.
+// Follows the Windows app theme (AppsUseLightTheme), like the rest of the app. Its colours are the hover
+// card's (fork): Windows' neutral flyout greys, the level in the device's colour (Windows green without
+// one) and charging in the strip's charging blue, so the card and this window read as one design.
 struct Palette {
-    COLORREF bg, panel, chart, border, grid, text, muted, blue, green, red, btnDown, btnActive, btnDisabledText;
+    COLORREF bg, panel, chart, border, grid, text, muted, level, charge, red, btnDown, btnActive, btnDisabledText;
 };
-constexpr Palette kDark = { RGB(12, 17, 28), RGB(22, 30, 45), RGB(15, 23, 37), RGB(47, 63, 83), RGB(42, 55, 74),
-                            RGB(232, 240, 252), RGB(165, 182, 202), RGB(91, 166, 255), RGB(59, 215, 158),
-                            RGB(255, 132, 147), RGB(38, 59, 83), RGB(31, 67, 112), RGB(102, 117, 136) };
-constexpr Palette kLight = { RGB(243, 245, 248), RGB(255, 255, 255), RGB(250, 251, 253), RGB(209, 215, 224),
-                             RGB(228, 232, 238), RGB(24, 32, 44), RGB(92, 104, 120), RGB(0, 103, 192),
-                             RGB(16, 137, 62), RGB(196, 43, 28), RGB(214, 226, 240), RGB(224, 236, 252),
-                             RGB(160, 168, 180) };
+constexpr Palette kDark = { RGB(32, 32, 32), RGB(44, 44, 44), RGB(38, 38, 38), RGB(66, 66, 66), RGB(58, 58, 58),
+                            RGB(242, 242, 242), RGB(170, 170, 170), RGB(108, 203, 95), RGB(96, 205, 255),
+                            RGB(255, 90, 90), RGB(58, 58, 58), RGB(54, 54, 54), RGB(120, 120, 120) };
+constexpr Palette kLight = { RGB(243, 243, 243), RGB(249, 249, 249), RGB(252, 252, 252), RGB(222, 222, 222),
+                             RGB(232, 232, 232), RGB(27, 27, 27), RGB(96, 96, 96), RGB(16, 124, 16),
+                             RGB(0, 120, 212), RGB(196, 30, 40), RGB(232, 232, 232), RGB(255, 255, 255),
+                             RGB(160, 160, 160) };
 bool g_light = false;
+int g_accent = 0;  // the device's Accent, 0 = none
 const Palette& P() { return g_light ? kLight : kDark; }
+// The device's colour for its level, as on the strip and in the card.
+COLORREF Level() {
+    if (g_accent == 0) return P().level;
+    BrandColor c = AccentColor(static_cast<Accent>(g_accent), g_light);
+    return RGB(c.r, c.g, c.b);
+}
+// `a` over `b`, `amount` 0..1 of `a`: GDI has no alpha, so translucent fills are mixed colours.
+COLORREF Mix(COLORREF a, COLORREF b, double amount) {
+    auto ch = [&](int x, int y) { return static_cast<int>(std::lround(x * amount + y * (1 - amount))); };
+    return RGB(ch(GetRValue(a), GetRValue(b)), ch(GetGValue(a), GetGValue(b)), ch(GetBValue(a), GetBValue(b)));
+}
 
 bool AppsUseLightTheme() {
     DWORD v = 1, sz = sizeof(v);
@@ -229,12 +244,12 @@ void DrawHistoryButton(const DRAWITEMSTRUCT* item) {
     const bool clear = item->CtlID == kClear;
     const COLORREF background = disabled ? P().bg : down ? P().btnDown :
                                 active ? P().btnActive : P().panel;
-    const COLORREF outline = disabled ? P().grid : (active || focused) ? P().blue : P().border;
+    const COLORREF outline = disabled ? P().grid : (active || focused) ? Level() : P().border;
     const COLORREF textColor = disabled ? P().btnDisabledText : clear ? P().red : active ? P().text : P().muted;
     HBRUSH corners = CreateSolidBrush(P().bg);  // behind the rounded corners, instead of the button's white
     FillRect(item->hDC, &item->rcItem, corners);
     DeleteObject(corners);
-    RoundedPanel(item->hDC, item->rcItem, background, outline, 12);
+    RoundedPanel(item->hDC, item->rcItem, background, outline, Ui(item->hwndItem, 8));
     wchar_t text[160]{};
     GetWindowTextW(item->hwndItem, text, 160);
     HFONT oldFont = static_cast<HFONT>(SelectObject(item->hDC,
@@ -248,7 +263,7 @@ void DrawHistoryButton(const DRAWITEMSTRUCT* item) {
 
 void DrawStat(HWND w, HDC dc, const RECT& r, const wchar_t* title,
               const std::wstring& value, COLORREF valueColor) {
-    RoundedPanel(dc, r, P().panel, P().border, Ui(w, 12));
+    RoundedPanel(dc, r, P().panel, P().border, Ui(w, 8));
     const int pad = Ui(w, 14);
     Label(dc, T(title), RECT{r.left + pad, r.top + Ui(w, 7), r.right - pad, r.top + Ui(w, 34)}, P().muted);
     HFONT old = static_cast<HFONT>(SelectObject(dc, g_uiValue ? g_uiValue : GetStockObject(DEFAULT_GUI_FONT)));
@@ -344,7 +359,7 @@ void Paint(HWND w) {
     if (stats.count >= 2) {
         const int change = stats.last - stats.first;
         delta = (change > 0 ? L"+" : L"") + std::to_wstring(change) + L" " + T(L"pp");
-        deltaColor = change > 0 ? P().green : P().text;  // discharging is normal, not an error
+        deltaColor = change > 0 ? P().charge : P().text;  // discharging is normal, not an error
     }
     const std::wstring values[] = {
         stats.count ? std::to_wstring(stats.last) + L"%" : L"—",
@@ -357,16 +372,16 @@ void Paint(HWND w) {
     for (int i = 0; i < 5; ++i) {
         const int x = margin + i * (cardWidth + gap);
         RECT card{x, Ui(w, 242), x + cardWidth, Ui(w, 318)};
-        DrawStat(w, dc, card, headings[i], values[i], i == 3 ? deltaColor : i == 0 ? P().blue : P().text);
+        DrawStat(w, dc, card, headings[i], values[i], i == 3 ? deltaColor : i == 0 ? Level() : P().text);
     }
 
     // The time left is what the window is opened for: it leads, the statistics follow (fork).
     RECT eta{margin, Ui(w, 148), width - margin, Ui(w, 229)};
-    RoundedPanel(dc, eta, P().panel, P().border, Ui(w, 12));
+    RoundedPanel(dc, eta, P().panel, P().border, Ui(w, 8));
     Label(dc, T(L"Estimated time to empty"),
           RECT{eta.left + Ui(w, 16), eta.top + Ui(w, 7), eta.right - Ui(w, 20), eta.top + Ui(w, 34)}, P().muted);
     std::wstring etaValue, etaDetails;
-    COLORREF etaColor = P().blue;
+    COLORREF etaColor = Level();
     switch (forecast.state) {
         case RuntimeState::Ready:
             etaValue = FormatRemaining(forecast.hoursRemaining);
@@ -376,7 +391,7 @@ void Paint(HWND w) {
         case RuntimeState::Charging:
             etaValue = T(L"Currently charging");
             etaDetails = T(L"No remaining-time estimate while charging.");
-            etaColor = P().green;
+            etaColor = P().charge;
             break;
         case RuntimeState::Stale:
             etaValue = T(L"No recent readings");
@@ -402,11 +417,11 @@ void Paint(HWND w) {
 
     RECT panel{margin, Ui(w, 332), width - margin, height - Ui(w, 22)};
     if (panel.bottom > panel.top + Ui(w, 140)) {
-        RoundedPanel(dc, panel, P().panel, P().border, Ui(w, 14));
+        RoundedPanel(dc, panel, P().panel, P().border, Ui(w, 8));
         {   // legend: a short line in each series' colour, then its name
             int lx = panel.left + Ui(w, 18);
             const int ly = panel.top + Ui(w, 25);
-            const std::pair<COLORREF, const wchar_t*> series[] = {{P().blue, L"Battery level"}, {P().green, L"Charging"}};
+            const std::pair<COLORREF, const wchar_t*> series[] = {{Level(), L"Battery level"}, {P().charge, L"Charging"}};
             for (const auto& entry : series) {
                 HPEN swatch = CreatePen(PS_SOLID, Ui(w, 3), entry.first);
                 HGDIOBJ before = SelectObject(dc, swatch);
@@ -425,7 +440,7 @@ void Paint(HWND w) {
         RECT plot{panel.left + Ui(w, 78), panel.top + Ui(w, 53),
                   panel.right - Ui(w, 21), panel.bottom - Ui(w, 61)};
         if (plot.right - plot.left > Ui(w, 120) && plot.bottom - plot.top > Ui(w, 68)) {
-            RoundedPanel(dc, plot, P().chart, P().chart, Ui(w, 6));
+            RoundedPanel(dc, plot, P().chart, P().chart, Ui(w, 4));
             const int graphW = plot.right - plot.left, graphH = plot.bottom - plot.top;
             HPEN grid = CreatePen(PS_SOLID, 1, P().grid);
             HPEN oldPen = static_cast<HPEN>(SelectObject(dc, grid));
@@ -448,8 +463,8 @@ void Paint(HWND w) {
                 const int saved = SaveDC(dc);
                 IntersectClipRect(dc, plot.left - Ui(w, 6), plot.top - Ui(w, 6),
                                   plot.left + static_cast<int>(graphW * RevealProgress()) + Ui(w, 6), plot.bottom + Ui(w, 6));
-                HPEN dataPen = CreatePen(PS_SOLID, Ui(w, 2), P().blue);
-                HPEN increasePen = CreatePen(PS_SOLID, Ui(w, 2), P().green);
+                HPEN dataPen = CreatePen(PS_SOLID, Ui(w, 2), Level());
+                HPEN increasePen = CreatePen(PS_SOLID, Ui(w, 2), P().charge);
                 const int64_t since = now - static_cast<int64_t>(g_days) * kSecondsPerDay;
                 const int64_t span = static_cast<int64_t>(g_days) * kSecondsPerDay;
                 int previousX = 0, previousY = 0, previousLevel = -1;
@@ -465,6 +480,15 @@ void Paint(HWND w) {
                         std::abs(sample.percent - previousLevel) <= 25;
                     const bool rising = joined && sample.percent > previousLevel;
                     if (joined) {
+                        // a soft fill under the line, as in the hover card's chart
+                        POINT area[] = {{previousX, previousY}, {x, y}, {x, plot.bottom}, {previousX, plot.bottom}};
+                        HBRUSH fill = CreateSolidBrush(Mix(rising ? P().charge : Level(), P().chart, g_light ? 0.12 : 0.16));
+                        HGDIOBJ oldFillBrush = SelectObject(dc, fill);
+                        HGDIOBJ oldFillPen = SelectObject(dc, GetStockObject(NULL_PEN));
+                        Polygon(dc, area, 4);
+                        SelectObject(dc, oldFillPen);
+                        SelectObject(dc, oldFillBrush);
+                        DeleteObject(fill);
                         HGDIOBJ pen = SelectObject(dc, rising ? increasePen : dataPen);
                         MoveToEx(dc, previousX, previousY, nullptr);
                         LineTo(dc, x, y);
@@ -472,7 +496,7 @@ void Paint(HWND w) {
                     }
                     // Sparse markers at 30 days avoid a heavy dotted line.
                     if (i + 1 == points.size() || points.size() <= 70 || i % 10 == 0) {
-                        HBRUSH dot = CreateSolidBrush(rising ? P().green : P().blue);
+                        HBRUSH dot = CreateSolidBrush(rising ? P().charge : Level());
                         HGDIOBJ oldP = SelectObject(dc, GetStockObject(NULL_PEN));
                         HGDIOBJ oldB = SelectObject(dc, dot);
                         const int radius = Ui(w, i + 1 == points.size() ? 4 : 2);
@@ -687,8 +711,9 @@ std::wstring EstimatedRuntimeText(const std::wstring& key) {
     return CompactRuntimeText(EstimateRuntime(samples, now));
 }
 
-void Show(HWND owner, const std::wstring& key, const std::wstring& displayName) {
+void Show(HWND owner, const std::wstring& key, const std::wstring& displayName, int accent) {
     if (key.empty()) return;
+    g_accent = accent;
     g_key = key;
     g_name = displayName;
     std::wstring title = std::wstring(T(L"Battery history")) + L" - " + displayName;

@@ -28,7 +28,9 @@ std::vector<Point> Recent(const std::wstring& key, int hours);
 // Empty when the conservative runtime forecast is unavailable; the UI should display % instead.
 std::wstring EstimatedRuntimeText(const std::wstring& key);
 // Non-modal native Win32 history viewer; device identity remains the original key.
-void Show(HWND owner, const std::wstring& key, const std::wstring& displayName);
+// `accent`: the device's brand colour (an Accent value, 0 = none); the chart and current level use it, like
+// the strip and its hover card.
+void Show(HWND owner, const std::wstring& key, const std::wstring& displayName, int accent = 0);
 // The viewer's "Estimated time to empty" as text ("~2 d 5 h"), or empty when there is none.
 std::wstring TimeToEmpty(const std::wstring& key);
 } // namespace battery_history
