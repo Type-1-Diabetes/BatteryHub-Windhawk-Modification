@@ -309,6 +309,13 @@ int Hi(const RECT& r, bool vertical) { return vertical ? r.bottom : r.right; }
 std::vector<Span> g_spans;   // guarded by g_wbLock
 bool g_wbMirrors;            // guarded by g_wbLock: measure secondary taskbars too
 bool g_wbFarLeft;            // guarded by g_wbLock: measure the primary taskbar too (far-left spot)
+// Windhawk pill (fork option): Taskbar Styler themes draw the notification area as a rounded "pill".
+// The strip then sits inside that pill, just left of its first button (the ^ chevron), in the room a
+// left padding in the Styler theme leaves there. Measured by the lookup thread with UI Automation.
+bool g_pill;                 // menu option
+bool g_wbPill;               // guarded by g_wbLock: measure the tray buttons of the primary taskbar
+HWND g_pillBar;              // guarded by g_wbLock: taskbar the measurement belongs to
+int g_pillLeft = INT_MIN;    // guarded by g_wbLock: screen x of the tray's leftmost button, INT_MIN if unknown
 
 IUIAutomationCondition* StringCondition(IUIAutomation* uia, PROPERTYID prop, const wchar_t* value) {
     VARIANT v;
@@ -404,6 +411,63 @@ Span MeasureSpan(IUIAutomation* uia, HWND bar) {
     return s;
 }
 
+// Screen x of the leftmost button of the notification area of a Windows 11 taskbar, INT_MIN when none is
+// found. Taskbar Styler themes move these buttons (padding inside the pill, or the whole tray moved into the
+// taskbar frame), so they are looked up by their XAML names, plus any button inside TrayNotifyWnd (the ^ chevron).
+int MeasurePillLeft(IUIAutomation* uia, HWND bar) {
+    int best = INT_MIN;
+    RECT br{}, tr{};
+    if (!GetWindowRect(bar, &br)) return best;
+    HWND tray = FindWindowExW(bar, nullptr, L"TrayNotifyWnd", nullptr);
+    bool hasTray = tray && GetWindowRect(tray, &tr) && tr.right > tr.left;
+    IUIAutomationElement* root = nullptr;
+    if (FAILED(uia->ElementFromHandle(bar, &root)) || !root) return best;
+    VARIANT button;
+    VariantInit(&button);
+    button.vt = VT_I4;
+    button.lVal = UIA_ButtonControlTypeId;
+    static const wchar_t* const kTrayIds[] = { L"SystemTrayIcon", L"NotifyItemIcon", L"ControlCenterButton",
+                                               L"NotificationCenterButton" };
+    IUIAutomationCondition* conds[5] = {};
+    int nc = 0;
+    if (SUCCEEDED(uia->CreatePropertyCondition(UIA_ControlTypePropertyId, button, &conds[nc])) && conds[nc]) nc++;
+    for (const wchar_t* id : kTrayIds)
+        if ((conds[nc] = StringCondition(uia, UIA_AutomationIdPropertyId, id))) nc++;
+    IUIAutomationCondition* any = nullptr;
+    IUIAutomationCacheRequest* req = nullptr;
+    IUIAutomationElementArray* all = nullptr;
+    int n = 0;
+    if (nc && SUCCEEDED(uia->CreateOrConditionFromNativeArray(conds, nc, &any)) && any &&
+        SUCCEEDED(uia->CreateCacheRequest(&req)) && req &&
+        SUCCEEDED(req->AddProperty(UIA_BoundingRectanglePropertyId)) &&
+        SUCCEEDED(req->AddProperty(UIA_AutomationIdPropertyId)) &&
+        SUCCEEDED(root->FindAllBuildCache(TreeScope_Descendants, any, req, &all)) && all &&
+        SUCCEEDED(all->get_Length(&n))) {
+        for (int i = 0; i < n; i++) {
+            IUIAutomationElement* el = nullptr;
+            RECT r{};
+            BSTR id = nullptr;
+            if (SUCCEEDED(all->GetElement(i, &el)) && el && SUCCEEDED(el->get_CachedBoundingRectangle(&r)) &&
+                r.right > r.left && r.bottom > r.top && r.left >= br.left && r.right <= br.right &&
+                r.top >= br.top && r.bottom <= br.bottom) {
+                bool trayId = false;
+                if (SUCCEEDED(el->get_CachedAutomationId(&id)) && id)
+                    for (const wchar_t* t : kTrayIds) trayId = trayId || !wcscmp(id, t);
+                bool inTray = hasTray && r.left >= tr.left && r.right <= tr.right;
+                if ((trayId || inTray) && (best == INT_MIN || r.left < best)) best = r.left;
+            }
+            if (id) SysFreeString(id);
+            if (el) el->Release();
+        }
+    }
+    if (all) all->Release();
+    if (req) req->Release();
+    if (any) any->Release();
+    for (int i = 0; i < nc; i++) conds[i]->Release();
+    root->Release();
+    return best;
+}
+
 bool IsXamlTaskbar(HWND bar) {
     return FindWindowExW(bar, nullptr, L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr) != nullptr;
 }
@@ -475,9 +539,10 @@ DWORD WINAPI WidgetsButtonThread(LPVOID) {
     IUIAutomationElement* btn = nullptr;
     HWND btnBar = nullptr;
     bool column = false;  // vertical XAML taskbar: its task buttons come and go, so look more often
+    bool pollPill = false;  // Windhawk pill: tray icons come and go too
     for (;;) {
         // No widget (tray-icon mode): sleep until one.
-        WaitForSingleObject(g_wbWake, btnBar ? (column ? 1500 : 5000) : INFINITE);
+        WaitForSingleObject(g_wbWake, btnBar ? (column || pollPill ? 1500 : 5000) : INFINITE);
         AcquireSRWLockShared(&g_wbLock);
         HWND bar = g_wbTaskbar;
         ReleaseSRWLockShared(&g_wbLock);
@@ -508,8 +573,11 @@ DWORD WINAPI WidgetsButtonThread(LPVOID) {
             }
         }
         AcquireSRWLockShared(&g_wbLock);
-        bool mirrors = g_wbMirrors, farLeft = g_wbFarLeft;
+        bool mirrors = g_wbMirrors, farLeft = g_wbFarLeft, pill = g_wbPill;
         ReleaseSRWLockShared(&g_wbLock);
+        int pillLeft = INT_MIN;
+        pollPill = pill;
+        if (bar && pill && uia && IsWindow(bar) && IsXamlTaskbar(bar) && !IsVerticalBar(bar)) pillLeft = MeasurePillLeft(uia, bar);
         std::vector<Span> spans;
         if (bar && farLeft && uia && IsWindow(bar) && IsXamlTaskbar(bar)) spans.push_back(MeasureSpan(uia, bar));
         if (bar && mirrors && uia)
@@ -526,6 +594,8 @@ DWORD WINAPI WidgetsButtonThread(LPVOID) {
             g_wbRectBar = bar;
         }
         g_spans = std::move(spans);
+        g_pillBar = bar;
+        g_pillLeft = pillLeft;
         ReleaseSRWLockExclusive(&g_wbLock);
     }
 }
@@ -2148,6 +2218,15 @@ void ApplyLeftSpot() {
     if (g_wnd) Reposition();
 }
 
+void SetWindhawkPill(bool on) {
+    g_pill = on;
+    AcquireSRWLockExclusive(&g_wbLock);
+    g_wbPill = on;
+    ReleaseSRWLockExclusive(&g_wbLock);
+    if (on && g_wbWake) SetEvent(g_wbWake);  // measure the tray now, not in 5 s
+    if (g_wnd) Reposition();
+}
+
 void SetFarLeft(bool on) {
     g_farLeft = on;
     ApplyLeftSpot();
@@ -2375,12 +2454,20 @@ bool Reposition() {
     // edge, so a window's client-space left edge is its screen-space right edge.
     bool rtl = GetWindowLongW(g_taskbar, GWL_EXSTYLE) & WS_EX_LAYOUTRTL;
     int edge = rtl ? tr.right : tr.left;  // screen x we sit next to
+    // Windhawk pill: sit inside the restyled tray, left of its first button.
+    bool inPill = false;
+    if (g_pill && !rtl) {
+        AcquireSRWLockShared(&g_wbLock);
+        int pillLeft = g_pillBar == g_taskbar ? g_pillLeft : INT_MIN;
+        ReleaseSRWLockShared(&g_wbLock);
+        if (pillLeft != INT_MIN && pillLeft > bar.left && pillLeft < bar.right) { edge = pillLeft; inPill = true; }
+    }
     // Windows 10: News and Interests / Weather sits immediately left of the tray. The window that hosts it
     // depends on the build: ShellFeedsTaskbarViewWindow on some, DynamicContent2 on others (e.g. 19045,
     // where the search highlights button is DynamicContent1). Both are direct children of the taskbar and
     // only a visible one counts. Its rectangle is read on every pass because the weather text changes its
     // width, so the widget follows it.
-    if (!rtl)
+    if (!rtl && !inPill)
         for (const wchar_t* cls : { L"ShellFeedsTaskbarViewWindow", L"DynamicContent2" }) {
             HWND feeds = FindWindowExW(g_taskbar, nullptr, cls, nullptr);
             if (!feeds || !IsWindowVisible(feeds)) continue;
@@ -2390,10 +2477,10 @@ bool Reposition() {
         }
     // Step past the Widgets button when it sits where we would go.
     RECT wb = WidgetsButtonRect();
-    if (wb.right > wb.left && wb.top < bar.bottom && wb.bottom > bar.top &&
+    if (!inPill && wb.right > wb.left && wb.top < bar.bottom && wb.bottom > bar.top &&
         (rtl ? wb.left < edge + g_size.cx + Px(2) && wb.right > edge : wb.right > edge - g_size.cx - Px(2) && wb.left < edge))
         edge = rtl ? wb.right : wb.left;
-    edge = StepPastOtherWidgets(edge, bar, false, rtl);
+    if (!inPill) edge = StepPastOtherWidgets(edge, bar, false, rtl);
     POINT p{ edge, bar.top };
     ScreenToClient(g_taskbar, &p);
     int left = p.x - g_size.cx - Px(2);
@@ -2417,7 +2504,7 @@ bool Reposition() {
     }
 
     int farX = 0;
-    bool atFarLeft = !rtl && (g_farLeft || g_beforeApps) && FarLeftX(g_taskbar, g_size.cx, farX);
+    bool atFarLeft = !rtl && !inPill && (g_farLeft || g_beforeApps) && FarLeftX(g_taskbar, g_size.cx, farX);
     if (atFarLeft) {
         POINT fp{ farX, bar.top };
         ScreenToClient(g_taskbar, &fp);
