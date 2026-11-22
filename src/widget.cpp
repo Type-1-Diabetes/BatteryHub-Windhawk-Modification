@@ -319,6 +319,19 @@ int g_pillLeft = INT_MIN;    // guarded by g_wbLock: screen x of the tray's left
 int g_pillTop, g_pillBottom; // guarded by g_wbLock: screen y span of that button (its hover highlight)
 bool g_inPill;               // UI thread: the strip sat inside the pill on the last placement
 int g_hoverTop = -1, g_hoverBottom = -1;  // UI thread: hover plate rows in the strip, -1 = default inset
+// Room the strip needs inside the pill, in 96-DPI pixels, published for the "BatteryHub pill room"
+// Windhawk mod (windhawk/batteryhub-pill-room.wh.cpp). The mod widens the pill's left padding by this
+// much, so the pill grows and shrinks with the strip. 0 = no room needed. -1 = not published yet.
+int g_publishedPillRoom = -1;
+
+void PublishPillRoom(int room) {
+    if (room == g_publishedPillRoom) return;
+    g_publishedPillRoom = room;
+    DWORD v = (DWORD)room;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\WirelessBattery", L"PillRoom", REG_DWORD, &v, sizeof(v));
+    // The tray buttons move once the mod has applied the padding: measure them again soon.
+    if (g_wbWake) SetEvent(g_wbWake);
+}
 
 IUIAutomationCondition* StringCondition(IUIAutomation* uia, PROPERTYID prop, const wchar_t* value) {
     VARIANT v;
@@ -2085,6 +2098,7 @@ bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme) {
 }
 
 void Destroy() {
+    PublishPillRoom(0);  // no strip: the pill gives the room back
     g_lastValidFinderPlacement = 0;
     g_orderGuard.Stop();
     if (g_finderOrderHook) UnhookWinEvent(g_finderOrderHook);
@@ -2250,6 +2264,7 @@ void SetWindhawkPill(bool on) {
     g_wbPill = on;
     ReleaseSRWLockExclusive(&g_wbLock);
     if (on && g_wbWake) SetEvent(g_wbWake);  // measure the tray now, not in 5 s
+    if (!on) PublishPillRoom(0);
     if (g_wnd) Reposition();
 }
 
@@ -2497,6 +2512,8 @@ bool Reposition() {
             }
         }
     }
+    // The strip's width plus the gap to the first tray button, in 96-DPI pixels for the mod.
+    PublishPillRoom(g_pill && !rtl ? MulDiv(g_size.cx + Px(2), 96, Dpi()) : 0);
     if (inPill != g_inPill || hoverTop != g_hoverTop || hoverBottom != g_hoverBottom) {
         g_inPill = inPill;
         g_hoverTop = hoverTop;
