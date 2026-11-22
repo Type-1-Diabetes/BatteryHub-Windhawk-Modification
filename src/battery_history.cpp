@@ -22,6 +22,11 @@ HWND g_view = nullptr;
 HWND g_btn24 = nullptr, g_btn7 = nullptr, g_btn30 = nullptr, g_btnClear = nullptr;
 std::wstring g_key, g_name;
 int g_days = 7;
+// The chart draws itself in from the left when it opens or the range changes (fork), unless Windows'
+// animation effects are off.
+constexpr UINT_PTR kRevealTimer = 1;
+constexpr ULONGLONG kRevealMs = 320;
+ULONGLONG g_revealStart = 0;
 constexpr int k24Hours = 201, k7Days = 202, k30Days = 203, kClear = 204;
 constexpr int64_t kSecondsPerDay = 86400;
 constexpr DWORD kMaxFileBytes = 4 * 1024 * 1024;
@@ -261,6 +266,40 @@ std::wstring FormatRemaining(double hours) {
     return TF(L"~{hours} h", {{L"hours", std::to_wstring(total)}});
 }
 
+bool AnimationsOn() {
+    BOOL on = TRUE;
+    return !SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0) || on;
+}
+
+void StartReveal(HWND w) {
+    g_revealStart = AnimationsOn() ? GetTickCount64() : 0;
+    if (g_revealStart) SetTimer(w, kRevealTimer, 16, nullptr);
+}
+
+// How much of the chart's width the data is drawn over now: 0..1, eased out.
+double RevealProgress() {
+    if (!g_revealStart) return 1;
+    double t = std::min(1.0, (GetTickCount64() - g_revealStart) / static_cast<double>(kRevealMs));
+    return 1 - (1 - t) * (1 - t) * (1 - t);
+}
+
+// The smallest range that holds the device's whole recorded history, so a new device does not open on
+// a nearly empty 7-day chart.
+int FittingDays(int64_t now) {
+    const auto all = g_demo ? DemoSamples(g_key, now) : g_store.For(g_key, now - 30 * kSecondsPerDay, now);
+    int64_t oldest = now;
+    for (const auto& sample : all) oldest = std::min(oldest, sample.timestamp);
+    return now - oldest <= kSecondsPerDay ? 1 : now - oldest <= 7 * kSecondsPerDay ? 7 : 30;
+}
+
+// One decimal in the user's Windows format ("37,2" in German, "37.2" in English).
+std::wstring OneDecimal(double value) {
+    wchar_t sep[8] = L".";
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SDECIMAL, sep, ARRAYSIZE(sep));
+    const int tenths = static_cast<int>(std::round(value * 10.0));
+    return std::to_wstring(tenths / 10) + sep + std::to_wstring(std::abs(tenths % 10));
+}
+
 void Paint(HWND w) {
     PAINTSTRUCT ps{};
     HDC screen = BeginPaint(w, &ps);
@@ -305,7 +344,7 @@ void Paint(HWND w) {
     if (stats.count >= 2) {
         const int change = stats.last - stats.first;
         delta = (change > 0 ? L"+" : L"") + std::to_wstring(change) + L" " + T(L"pp");
-        deltaColor = change < 0 ? P().red : change > 0 ? P().green : P().text;
+        deltaColor = change > 0 ? P().green : P().text;  // discharging is normal, not an error
     }
     const std::wstring values[] = {
         stats.count ? std::to_wstring(stats.last) + L"%" : L"—",
@@ -317,11 +356,12 @@ void Paint(HWND w) {
     const wchar_t* headings[] = {L"Latest", L"Lowest", L"Highest", L"Change", L"Readings"};
     for (int i = 0; i < 5; ++i) {
         const int x = margin + i * (cardWidth + gap);
-        RECT card{x, Ui(w, 148), x + cardWidth, Ui(w, 224)};
+        RECT card{x, Ui(w, 242), x + cardWidth, Ui(w, 318)};
         DrawStat(w, dc, card, headings[i], values[i], i == 3 ? deltaColor : i == 0 ? P().blue : P().text);
     }
 
-    RECT eta{margin, Ui(w, 237), width - margin, Ui(w, 318)};
+    // The time left is what the window is opened for: it leads, the statistics follow (fork).
+    RECT eta{margin, Ui(w, 148), width - margin, Ui(w, 229)};
     RoundedPanel(dc, eta, P().panel, P().border, Ui(w, 12));
     Label(dc, T(L"Estimated time to empty"),
           RECT{eta.left + Ui(w, 16), eta.top + Ui(w, 7), eta.right - Ui(w, 20), eta.top + Ui(w, 34)}, P().muted);
@@ -330,10 +370,8 @@ void Paint(HWND w) {
     switch (forecast.state) {
         case RuntimeState::Ready:
             etaValue = FormatRemaining(forecast.hoursRemaining);
-            etaDetails = TF(L"Recent discharge: {rate} pp/day · {count} readings", {
-                {L"rate", std::to_wstring(static_cast<int>(std::round(forecast.percentPerHour * 240.0)) / 10) +
-                          L"." + std::to_wstring(static_cast<int>(std::round(forecast.percentPerHour * 240.0)) % 10)},
-                {L"count", std::to_wstring(forecast.sampleCount)}});
+            // The readings count is already in its own card below.
+            etaDetails = TF(L"Recent discharge: {rate} pp/day", {{L"rate", OneDecimal(forecast.percentPerHour * 24.0)}});
             break;
         case RuntimeState::Charging:
             etaValue = T(L"Currently charging");
@@ -365,8 +403,25 @@ void Paint(HWND w) {
     RECT panel{margin, Ui(w, 332), width - margin, height - Ui(w, 22)};
     if (panel.bottom > panel.top + Ui(w, 140)) {
         RoundedPanel(dc, panel, P().panel, P().border, Ui(w, 14));
-        Label(dc, T(L"Blue: recorded battery; green: measured increase"),
-              RECT{panel.left + Ui(w, 18), panel.top + Ui(w, 8), panel.right - Ui(w, 12), panel.top + Ui(w, 42)}, P().muted);
+        {   // legend: a short line in each series' colour, then its name
+            int lx = panel.left + Ui(w, 18);
+            const int ly = panel.top + Ui(w, 25);
+            const std::pair<COLORREF, const wchar_t*> series[] = {{P().blue, L"Battery level"}, {P().green, L"Charging"}};
+            for (const auto& entry : series) {
+                HPEN swatch = CreatePen(PS_SOLID, Ui(w, 3), entry.first);
+                HGDIOBJ before = SelectObject(dc, swatch);
+                MoveToEx(dc, lx, ly, nullptr);
+                LineTo(dc, lx + Ui(w, 16), ly);
+                SelectObject(dc, before);
+                DeleteObject(swatch);
+                const std::wstring name = T(entry.second);
+                SIZE extent{};
+                GetTextExtentPoint32W(dc, name.c_str(), static_cast<int>(name.size()), &extent);
+                Label(dc, name, RECT{lx + Ui(w, 22), panel.top + Ui(w, 8), lx + Ui(w, 22) + extent.cx + Ui(w, 4), panel.top + Ui(w, 42)},
+                      P().muted);
+                lx += Ui(w, 22) + extent.cx + Ui(w, 20);
+            }
+        }
         RECT plot{panel.left + Ui(w, 78), panel.top + Ui(w, 53),
                   panel.right - Ui(w, 21), panel.bottom - Ui(w, 61)};
         if (plot.right - plot.left > Ui(w, 120) && plot.bottom - plot.top > Ui(w, 68)) {
@@ -390,6 +445,9 @@ void Paint(HWND w) {
             DeleteObject(grid);
 
             if (!points.empty()) {
+                const int saved = SaveDC(dc);
+                IntersectClipRect(dc, plot.left - Ui(w, 6), plot.top - Ui(w, 6),
+                                  plot.left + static_cast<int>(graphW * RevealProgress()) + Ui(w, 6), plot.bottom + Ui(w, 6));
                 HPEN dataPen = CreatePen(PS_SOLID, Ui(w, 2), P().blue);
                 HPEN increasePen = CreatePen(PS_SOLID, Ui(w, 2), P().green);
                 const int64_t since = now - static_cast<int64_t>(g_days) * kSecondsPerDay;
@@ -428,6 +486,7 @@ void Paint(HWND w) {
                 }
                 DeleteObject(dataPen);
                 DeleteObject(increasePen);
+                RestoreDC(dc, saved);
             } else {
                 Label(dc, T(L"No readings in this period"),
                       RECT{plot.left + Ui(w, 10), plot.top, plot.right - Ui(w, 10), plot.bottom},
@@ -484,6 +543,7 @@ LRESULT CALLBACK ViewProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             for (HWND b : {g_btn24, g_btn7, g_btn30, g_btnClear}) SetControlFont(b);
             EnableWindow(g_btnClear, g_demo ? FALSE : TRUE);
             Layout(w);
+            StartReveal(w);
             return 0;
         }
         case WM_GETMINMAXINFO: {
@@ -500,9 +560,9 @@ LRESULT CALLBACK ViewProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_COMMAND:
             switch (LOWORD(wp)) {
-                case k24Hours: g_days = 1; break;
-                case k7Days:   g_days = 7; break;
-                case k30Days:  g_days = 30; break;
+                case k24Hours: g_days = 1; StartReveal(w); break;
+                case k7Days:   g_days = 7; StartReveal(w); break;
+                case k30Days:  g_days = 30; StartReveal(w); break;
                 case kClear:
                     if (!g_demo && MessageBoxW(w, T(L"Clear battery history for this device?"),
                                                T(L"Battery history"), MB_YESNO | MB_ICONQUESTION) == IDYES) {
@@ -518,6 +578,12 @@ LRESULT CALLBACK ViewProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 default: return 0;
             }
             InvalidateRect(w, nullptr, TRUE);
+            return 0;
+        case WM_TIMER:
+            if (wp == kRevealTimer) {
+                if (RevealProgress() >= 1) { KillTimer(w, kRevealTimer); g_revealStart = 0; }
+                InvalidateRect(w, nullptr, FALSE);
+            }
             return 0;
         case WM_PAINT: Paint(w); return 0;
         case WM_ERASEBKGND: return 1;
@@ -626,8 +692,11 @@ void Show(HWND owner, const std::wstring& key, const std::wstring& displayName) 
     g_key = key;
     g_name = displayName;
     std::wstring title = std::wstring(T(L"Battery history")) + L" - " + displayName;
+    g_days = FittingDays(UtcNow());
     if (g_view && IsWindow(g_view)) {
         SetWindowTextW(g_view, title.c_str());
+        for (HWND b : {g_btn24, g_btn7, g_btn30}) if (b) InvalidateRect(b, nullptr, TRUE);
+        StartReveal(g_view);
         ShowWindow(g_view, SW_RESTORE);
         SetForegroundWindow(g_view);
         InvalidateRect(g_view, nullptr, TRUE);
@@ -641,7 +710,6 @@ void Show(HWND owner, const std::wstring& key, const std::wstring& displayName) 
     wc.hbrBackground = nullptr;  // WM_PAINT fills the whole window
     wc.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
-    g_days = 7;
     RECT bounds{0, 0, 1020, 710};
     AdjustWindowRectEx(&bounds, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_APPWINDOW);
     g_view = CreateWindowExW(WS_EX_APPWINDOW, kWindowClass, title.c_str(), WS_OVERLAPPEDWINDOW,
