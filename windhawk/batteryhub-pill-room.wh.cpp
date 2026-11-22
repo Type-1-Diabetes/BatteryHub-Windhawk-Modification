@@ -20,20 +20,21 @@
 # BatteryHub pill room
 
 Companion mod for the BatteryHub Windhawk modification. With **Display settings
-→ Inside the Windhawk tray pill** turned on, BatteryHub sits inside the rounded
-tray "pill" that Windows 11 Taskbar Styler themes (for example Matter) draw.
+→ Inside the Windhawk tray pill** on, BatteryHub sits inside the rounded tray
+"pill" that Taskbar Styler themes such as Matter draw.
 
-A fixed padding in the Styler theme leaves either too little room (devices that
-come and go, like headphones, end up outside the pill) or an empty gap. This mod
-reads the room BatteryHub needs from
-`HKEY_CURRENT_USER\Software\WirelessBattery\PillRoom` and adds it to the left
-margin of the first item inside the pill (`SystemTrayFrameGrid`) live, so the
-pill grows and shrinks with the strip. The pill's own padding stays the theme's.
+A fixed padding in the theme is either too small (headphones that switch on push
+the strip out of the pill) or leaves a gap when they are off. This mod reads the
+width BatteryHub needs from `HKEY_CURRENT_USER\Software\WirelessBattery\PillRoom`
+and adds it to the left margin of the first item in the pill
+(`SystemTrayFrameGrid`), so the pill grows and shrinks with the strip. The theme
+keeps its own padding.
 
-Remove any left padding you added for BatteryHub in the Styler settings: this
-mod adds the room on top of the theme's own padding.
+It also tells BatteryHub the shape of the tray buttons' hover plate, so hovering
+a device looks like hovering a tray icon.
 
-Only the main taskbar is changed, the one BatteryHub sits inside.
+If you added a left padding for BatteryHub in the Styler settings, remove it.
+Only the main taskbar changes.
 */
 // ==/WindhawkModReadme==
 
@@ -42,13 +43,13 @@ Only the main taskbar is changed, the one BatteryHub sits inside.
 - extraRoom: 0
   $name: Extra room
   $description: >-
-    Pixels added to the room BatteryHub asks for (negative values take some
-    away), to fine-tune the spacing in the pill
+    Pixels added to the width BatteryHub asks for, to fine-tune the spacing in
+    the pill. Negative values take some away.
 - animationMs: 150
   $name: Animation duration
   $description: >-
     How long the pill takes to grow or shrink, in milliseconds. 0 changes it
-    at once. Off as well when Windows' animation effects are turned off.
+    at once, and so does turning off Windows' animation effects.
 */
 // ==/WindhawkModSettings==
 
