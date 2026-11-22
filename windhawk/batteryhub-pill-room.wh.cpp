@@ -2,7 +2,7 @@
 // @id              batteryhub-pill-room
 // @name            BatteryHub pill room
 // @description     Widens a Taskbar Styler tray "pill" by exactly the width of the BatteryHub strip
-// @version         1.1.0
+// @version         1.2.0
 // @author          BatteryHub Windhawk modification
 // @include         explorer.exe
 // @architecture    x86-64
@@ -27,8 +27,8 @@ A fixed padding in the Styler theme leaves either too little room (devices that
 come and go, like headphones, end up outside the pill) or an empty gap. This mod
 reads the room BatteryHub needs from
 `HKEY_CURRENT_USER\Software\WirelessBattery\PillRoom` and adds it to the left
-padding of the pill (`SystemTrayFrameGrid`) live, so the pill grows and shrinks
-with the strip.
+margin of the first item inside the pill (`SystemTrayFrameGrid`) live, so the
+pill grows and shrinks with the strip. The pill's own padding stays the theme's.
 
 Remove any left padding you added for BatteryHub in the Styler settings: this
 mod adds the room on top of the theme's own padding.
@@ -202,26 +202,13 @@ FrameworkElement FindSystemTrayFrame(FrameworkElement xamlRootContent) {
     return systemTrayFrame;
 }
 
-// The element that draws the pill: a Grid on older builds, a StackPanel on
-// newer ones. Both have a Padding property, under different owners.
-DependencyProperty PaddingPropertyOf(FrameworkElement element) {
-    if (element.try_as<Controls::Grid>()) {
-        return Controls::Grid::PaddingProperty();
-    }
-    if (element.try_as<Controls::StackPanel>()) {
-        return Controls::StackPanel::PaddingProperty();
-    }
-    if (element.try_as<Controls::Border>()) {
-        return Controls::Border::PaddingProperty();
-    }
-    return nullptr;
-}
-
 // Only accessed from the taskbar thread.
 struct PillTarget {
     winrt::weak_ref<FrameworkElement> element;
-    DependencyProperty paddingProperty{nullptr};
-    Thickness basePadding{};  // the padding without our room (the theme's)
+    // The pill's first item (the leftmost tray button group): its left margin makes the room. The pill's
+    // own Padding is left alone, since Taskbar Styler themes set it and put it back when it changes.
+    DependencyProperty paddingProperty{nullptr};  // FrameworkElement::Margin of that item
+    Thickness basePadding{};  // its margin without our room (the theme's)
     int64_t callbackToken = 0;
     bool settingPadding = false;
     // The room shown now, and the glide to a new room (frames on CompositionTarget::Rendering).
@@ -247,6 +234,12 @@ void SetPadding(PillTarget& target, FrameworkElement element, double room) {
     target.settingPadding = false;
 }
 
+void LogApplied(PillTarget& target, FrameworkElement element) {
+    auto now = winrt::unbox_value<Thickness>(element.GetValue(target.paddingProperty));
+    Wh_Log(L"Room %.0f: left margin %.0f + %.0f, reads back %.0f", target.shownRoom,
+           target.basePadding.Left, std::round(target.shownRoom), now.Left);
+}
+
 bool AnimationsOn() {
     BOOL on = TRUE;
     return g_animationMs > 0 &&
@@ -265,6 +258,7 @@ void GlideTo(PillTarget& target, FrameworkElement element, int room) {
     if (!AnimationsOn() || std::abs(room - target.shownRoom) < 1) {
         StopGlide(target);
         SetPadding(target, element, room);
+        LogApplied(target, element);
         return;
     }
     target.fromRoom = target.shownRoom;
@@ -293,6 +287,7 @@ void GlideTo(PillTarget& target, FrameworkElement element, int room) {
                            (g_target->toRoom - g_target->fromRoom) * e);
             if (t >= 1) {
                 StopGlide(*g_target);
+                LogApplied(*g_target, element);
             }
         });
 }
@@ -323,33 +318,49 @@ int CurrentRoom() {
 
 bool ApplyRoom(XamlRoot xamlRoot) {
     auto content = xamlRoot.Content().try_as<FrameworkElement>();
-    auto trayFrame = content ? FindSystemTrayFrame(content) : nullptr;
-    auto pill = trayFrame
-                    ? FindDescendantByName(trayFrame, L"SystemTrayFrameGrid")
-                    : nullptr;
+    if (!content) {
+        Wh_Log(L"No XAML content yet");
+        return false;
+    }
+    auto trayFrame = FindSystemTrayFrame(content);
+    if (!trayFrame) {
+        Wh_Log(L"SystemTrayFrame not found under %s",
+               winrt::get_class_name(content).c_str());
+        return false;
+    }
+    auto pill = FindDescendantByName(trayFrame, L"SystemTrayFrameGrid");
     if (!pill) {
+        Wh_Log(L"SystemTrayFrameGrid not found");
+        return false;
+    }
+    FrameworkElement first = nullptr;
+    EnumChildElements(pill, [&first](FrameworkElement child) {
+        first = child;
+        return true;
+    });
+    if (!first) {
+        Wh_Log(L"SystemTrayFrameGrid (%s) has no children yet",
+               winrt::get_class_name(pill).c_str());
         return false;
     }
 
-    if (!g_target || g_target->element.get() != pill) {
+    if (!g_target || g_target->element.get() != first) {
         ReleaseTarget(/*restore=*/true);
 
-        auto paddingProperty = PaddingPropertyOf(pill);
-        if (!paddingProperty) {
-            Wh_Log(L"SystemTrayFrameGrid has no Padding property");
-            return true;
-        }
-
         g_target.emplace();
-        g_target->element = pill;
-        g_target->paddingProperty = paddingProperty;
+        g_target->element = first;
+        g_target->paddingProperty = FrameworkElement::MarginProperty();
         g_target->basePadding =
-            winrt::unbox_value<Thickness>(pill.GetValue(paddingProperty));
+            winrt::unbox_value<Thickness>(first.GetValue(g_target->paddingProperty));
+        Wh_Log(L"Pill %s, first item %s \"%s\", margin left %.0f",
+               winrt::get_class_name(pill).c_str(),
+               winrt::get_class_name(first).c_str(), first.Name().c_str(),
+               g_target->basePadding.Left);
 
         // Taskbar Styler sets the theme's padding when it (re)applies its
         // styles. Take that as the new base and add the room on top again.
-        g_target->callbackToken = pill.RegisterPropertyChangedCallback(
-            paddingProperty,
+        g_target->callbackToken = first.RegisterPropertyChangedCallback(
+            g_target->paddingProperty,
             [](DependencyObject const& sender, DependencyProperty const& dp) {
                 if (!g_target || g_target->settingPadding || g_unloading) {
                     return;
@@ -360,12 +371,14 @@ bool ApplyRoom(XamlRoot xamlRoot) {
                 }
                 g_target->basePadding =
                     winrt::unbox_value<Thickness>(element.GetValue(dp));
+                Wh_Log(L"Margin changed elsewhere, new base %.0f",
+                       g_target->basePadding.Left);
                 StopGlide(*g_target);
                 SetPadding(*g_target, element, CurrentRoom());
             });
     }
 
-    GlideTo(*g_target, pill, CurrentRoom());
+    GlideTo(*g_target, first, CurrentRoom());
     return true;
 }
 
@@ -406,6 +419,7 @@ void ApplyRoomWhenTrayAdded(XamlRoot xamlRoot) {
 
             try {
                 if (ApplyRoom(taskbarFrame.XamlRoot())) {
+                    Wh_Log(L"Tray ready");
                     g_trayAddedWaits->erase(it);
                 }
             } catch (...) {
@@ -556,6 +570,7 @@ void ApplyFromTaskbarThread() {
         }
 
         if (!ApplyRoom(xamlRoot)) {
+            Wh_Log(L"Tray not ready, waiting for it");
             ApplyRoomWhenTrayAdded(xamlRoot);
         }
     } catch (...) {
