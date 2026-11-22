@@ -316,6 +316,9 @@ bool g_pill;                 // menu option
 bool g_wbPill;               // guarded by g_wbLock: measure the tray buttons of the primary taskbar
 HWND g_pillBar;              // guarded by g_wbLock: taskbar the measurement belongs to
 int g_pillLeft = INT_MIN;    // guarded by g_wbLock: screen x of the tray's leftmost button, INT_MIN if unknown
+int g_pillTop, g_pillBottom; // guarded by g_wbLock: screen y span of that button (its hover highlight)
+bool g_inPill;               // UI thread: the strip sat inside the pill on the last placement
+int g_hoverTop = -1, g_hoverBottom = -1;  // UI thread: hover plate rows in the strip, -1 = default inset
 
 IUIAutomationCondition* StringCondition(IUIAutomation* uia, PROPERTYID prop, const wchar_t* value) {
     VARIANT v;
@@ -414,7 +417,8 @@ Span MeasureSpan(IUIAutomation* uia, HWND bar) {
 // Screen x of the leftmost button of the notification area of a Windows 11 taskbar, INT_MIN when none is
 // found. Taskbar Styler themes move these buttons (padding inside the pill, or the whole tray moved into the
 // taskbar frame), so they are looked up by their XAML names, plus any button inside TrayNotifyWnd (the ^ chevron).
-int MeasurePillLeft(IUIAutomation* uia, HWND bar) {
+// `found` receives that button's rectangle: the strip's hover plate takes its height.
+int MeasurePillLeft(IUIAutomation* uia, HWND bar, RECT* found) {
     int best = INT_MIN;
     RECT br{}, tr{};
     if (!GetWindowRect(bar, &br)) return best;
@@ -454,7 +458,10 @@ int MeasurePillLeft(IUIAutomation* uia, HWND bar) {
                 if (SUCCEEDED(el->get_CachedAutomationId(&id)) && id)
                     for (const wchar_t* t : kTrayIds) trayId = trayId || !wcscmp(id, t);
                 bool inTray = hasTray && r.left >= tr.left && r.right <= tr.right;
-                if ((trayId || inTray) && (best == INT_MIN || r.left < best)) best = r.left;
+                if ((trayId || inTray) && (best == INT_MIN || r.left < best)) {
+                    best = r.left;
+                    *found = r;
+                }
             }
             if (id) SysFreeString(id);
             if (el) el->Release();
@@ -576,8 +583,10 @@ DWORD WINAPI WidgetsButtonThread(LPVOID) {
         bool mirrors = g_wbMirrors, farLeft = g_wbFarLeft, pill = g_wbPill;
         ReleaseSRWLockShared(&g_wbLock);
         int pillLeft = INT_MIN;
+        RECT pillButton{};
         pollPill = pill;
-        if (bar && pill && uia && IsWindow(bar) && IsXamlTaskbar(bar) && !IsVerticalBar(bar)) pillLeft = MeasurePillLeft(uia, bar);
+        if (bar && pill && uia && IsWindow(bar) && IsXamlTaskbar(bar) && !IsVerticalBar(bar))
+            pillLeft = MeasurePillLeft(uia, bar, &pillButton);
         std::vector<Span> spans;
         if (bar && farLeft && uia && IsWindow(bar) && IsXamlTaskbar(bar)) spans.push_back(MeasureSpan(uia, bar));
         if (bar && mirrors && uia)
@@ -596,6 +605,8 @@ DWORD WINAPI WidgetsButtonThread(LPVOID) {
         g_spans = std::move(spans);
         g_pillBar = bar;
         g_pillLeft = pillLeft;
+        g_pillTop = pillButton.top;
+        g_pillBottom = pillButton.bottom;
         ReleaseSRWLockExclusive(&g_wbLock);
     }
 }
@@ -1044,7 +1055,22 @@ bool PaintStrip(HWND wnd, HWND taskbar, bool hover, SIZE& size, std::vector<RECT
     // (e.g. Windhawk's Taskbar Styler) makes the bar transparent over the wallpaper.
     Rgb barColor = g_light ? Rgb{ 243, 243, 243 } : Rgb{ 32, 32, 32 };
     if (g_background && !g_myFinder) roundRect(Px(4), Px(6), barColor, 240);
-    if (hover && !g_myFinder) roundRect(Px(4), Px(4), g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }, g_light ? 20 : 26);
+    Rgb hoverColor = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
+    int hoverAlpha = g_light ? 20 : 26;
+    if (hover && !g_myFinder && wnd == g_wnd && g_inPill && g_hoverTop >= 0 && g_hoverBottom <= H &&
+        g_hoverBottom - g_hoverTop > Px(8)) {
+        // Inside a Windhawk pill: the height and corners of the tray's own button highlight, so the
+        // plate stays within the pill instead of spilling over its rounded edge.
+        int r = Px(4), top = g_hoverTop, bottom = g_hoverBottom, side = Px(2);
+        for (int y = top; y < bottom; y++)
+            for (int x = side; x < W - side; x++) {
+                int dx = x < side + r ? side + r - x : (x >= W - side - r ? x - (W - side - r - 1) : 0);
+                int dy = y < top + r ? top + r - y : (y >= bottom - r ? y - (bottom - r - 1) : 0);
+                if (dx * dx + dy * dy <= r * r) cv.Blend(x, y, hoverColor, hoverAlpha);
+            }
+    } else if (hover && !g_myFinder) {
+        roundRect(Px(4), Px(4), hoverColor, hoverAlpha);
+    }
 
     int x = Px(8);
     Rgb track = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
@@ -2456,11 +2482,26 @@ bool Reposition() {
     int edge = rtl ? tr.right : tr.left;  // screen x we sit next to
     // Windhawk pill: sit inside the restyled tray, left of its first button.
     bool inPill = false;
+    int hoverTop = -1, hoverBottom = -1;
     if (g_pill && !rtl) {
         AcquireSRWLockShared(&g_wbLock);
         int pillLeft = g_pillBar == g_taskbar ? g_pillLeft : INT_MIN;
+        int pillTop = g_pillTop, pillBottom = g_pillBottom;
         ReleaseSRWLockShared(&g_wbLock);
-        if (pillLeft != INT_MIN && pillLeft > bar.left && pillLeft < bar.right) { edge = pillLeft; inPill = true; }
+        if (pillLeft != INT_MIN && pillLeft > bar.left && pillLeft < bar.right) {
+            edge = pillLeft;
+            inPill = true;
+            if (pillTop >= bar.top && pillBottom <= bar.bottom && pillBottom > pillTop) {
+                hoverTop = pillTop - bar.top;  // the strip spans the bar's height from its top
+                hoverBottom = pillBottom - bar.top;
+            }
+        }
+    }
+    if (inPill != g_inPill || hoverTop != g_hoverTop || hoverBottom != g_hoverBottom) {
+        g_inPill = inPill;
+        g_hoverTop = hoverTop;
+        g_hoverBottom = hoverBottom;
+        if (g_hover) Paint();  // only the hover plate depends on these
     }
     // Windows 10: News and Interests / Weather sits immediately left of the tray. The window that hosts it
     // depends on the build: ShellFeedsTaskbarViewWindow on some, DynamicContent2 on others (e.g. 19045,
